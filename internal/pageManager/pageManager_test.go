@@ -709,7 +709,7 @@ func TestEdgeCase_MethodsAfterClose(t *testing.T) {
 		path := newTempPath(t)
 		pm := mustNewDB(t, path)
 		mustClose(t, pm)
-		checkNoPanic(t, "ReadPage", func() { pm.ReadPage(0) })
+		checkNoPanic(t, "ReadPage", func() { _, _ = pm.ReadPage(0) })
 	})
 
 	t.Run("WritePage", func(t *testing.T) {
@@ -718,7 +718,7 @@ func TestEdgeCase_MethodsAfterClose(t *testing.T) {
 		mustClose(t, pm)
 		checkNoPanic(t, "WritePage", func() {
 			p := &Page{}
-			pm.WritePage(p)
+			_ = pm.WritePage(p)
 		})
 	})
 
@@ -726,14 +726,14 @@ func TestEdgeCase_MethodsAfterClose(t *testing.T) {
 		path := newTempPath(t)
 		pm := mustNewDB(t, path)
 		mustClose(t, pm)
-		checkNoPanic(t, "AllocatePage", func() { pm.AllocatePage() })
+		checkNoPanic(t, "AllocatePage", func() { _, _ = pm.AllocatePage() })
 	})
 
 	t.Run("FreePage", func(t *testing.T) {
 		path := newTempPath(t)
 		pm := mustNewDB(t, path)
 		mustClose(t, pm)
-		checkNoPanic(t, "FreePage", func() { pm.FreePage(0) })
+		checkNoPanic(t, "FreePage", func() { _ = pm.FreePage(0) })
 	})
 }
 
