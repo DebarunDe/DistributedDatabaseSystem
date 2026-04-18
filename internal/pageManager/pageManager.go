@@ -76,10 +76,10 @@ func (pm *PageManagerImpl) ReadPage(pageId uint32) (*Page, error) {
 		return nil, fmt.Errorf("invalid page id: %d, page count: %d", pageId, pm.metaPage.GetMetaPageCount())
 	}
 
-	fileOffset := pageId * PageSize
+	fileOffset := int64(pageId) * PageSize
 
 	p := &Page{}
-	if _, err := pm.file.ReadAt(p.Data[:], int64(fileOffset)); err != nil {
+	if _, err := pm.file.ReadAt(p.Data[:], fileOffset); err != nil {
 		return nil, fmt.Errorf("failed to read page at offset %d: %w", fileOffset, err)
 	}
 
@@ -101,9 +101,9 @@ func (pm *PageManagerImpl) WritePage(p *Page) error {
 		return fmt.Errorf("invalid page id: %d, page count: %d", pageId, pm.metaPage.GetMetaPageCount())
 	}
 
-	fileOffset := pageId * PageSize
+	fileOffset := int64(pageId) * PageSize
 
-	if _, err := pm.file.WriteAt(p.Data[:], int64(fileOffset)); err != nil {
+	if _, err := pm.file.WriteAt(p.Data[:], fileOffset); err != nil {
 		return fmt.Errorf("failed to write page at offset %d: %w", fileOffset, err)
 	}
 
@@ -233,7 +233,7 @@ func NewDB(path string) (PageManager, error) {
 	return &PageManagerImpl{
 		file:     file,
 		metaPage: p,
-	}, err
+	}, nil
 }
 
 func OpenDB(path string) (PageManager, error) {
@@ -247,7 +247,7 @@ func OpenDB(path string) (PageManager, error) {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return nil, os.ErrInvalid
+		return nil, err
 	}
 
 	if info.Size() < PageSize {
