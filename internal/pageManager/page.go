@@ -203,6 +203,11 @@ func (p *Page) setRightSibling(siblingId uint32) {
 	writeUint32(p, OffsetRightSibling, siblingId)
 }
 
+func (p *Page) UpdateSiblings(leftSibling uint32, rightSibling uint32) {
+	p.setLeftSibling(leftSibling)
+	p.setRightSibling(rightSibling)
+}
+
 // Free page accessors
 func (p *Page) getFreeNextPage() uint32 {
 	return readUint32(p, OffsetFreeNextPage)
@@ -221,12 +226,20 @@ func (p *Page) setRightMostChild(childId uint32) {
 	writeUint32(p, OffsetRightmostChild, childId)
 }
 
+func (p *Page) SetRightMostChild(childId uint32) {
+	p.setRightMostChild(childId)
+}
+
 func (p *Page) GetLevel() uint16 {
 	return readUint16(p, OffsetLevel)
 }
 
 func (p *Page) setLevel(level uint16) {
 	writeUint16(p, OffsetLevel, level)
+}
+
+func (p *Page) SetLevel(level uint16) {
+	p.setLevel(level)
 }
 
 func (p *Page) GetMetaPageMagicNumber() uint32 {
@@ -410,6 +423,32 @@ func (p *Page) InsertRecord(record []byte) (int, bool) {
 	p.setRowCount(uint16(slotIndex + 1))
 
 	return slotIndex, true
+}
+
+func (p *Page) InsertRecordAt(slotIndex int, record []byte) bool {
+	if p.GetPageType() == PageTypeMeta || p.GetPageType() == PageTypeOverflow {
+		panic("cannot insert records into meta/overflow pages")
+	}
+
+	if slotIndex < 0 || slotIndex > int(p.GetRowCount()) {
+		panic("invalid slot index for insertion")
+	}
+
+	if !p.CanAccommodate(len(record)) {
+		return false
+	}
+
+	// Shift existing slots down to make room for new slot
+	for i := int(p.GetRowCount()); i > slotIndex; i-- {
+		copy(p.Data[p.headerSize()+i*4:], p.Data[p.headerSize()+(i-1)*4:p.headerSize()+i*4])
+	}
+
+	p.setFreeSpaceStart(uint16(p.headerSize()) + (p.GetRowCount()+1)*4)
+
+	p.setRecord(slotIndex, record, false)
+	p.setRowCount(p.GetRowCount() + 1)
+
+	return true
 }
 
 // Free space Management Functions

@@ -722,6 +722,227 @@ func TestInsertRecord_InternalPageDoesNotCorruptChild(t *testing.T) {
 }
 
 // ============================================================
+// InsertRecordAt
+// ============================================================
+
+func TestInsertRecordAt_AtEnd_EquivalentToAppend(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("a"))
+	p.InsertRecord([]byte("b"))
+
+	ok := p.InsertRecordAt(2, []byte("c"))
+	if !ok {
+		t.Fatal("InsertRecordAt at end returned false")
+	}
+	got, ok := p.GetRecord(2)
+	if !ok || !bytes.Equal(got, []byte("c")) {
+		t.Errorf("GetRecord(2) = %q ok=%v, want %q true", got, ok, "c")
+	}
+}
+
+func TestInsertRecordAt_AtBeginning_ShiftsAllSlots(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("first"))
+	p.InsertRecord([]byte("second"))
+
+	ok := p.InsertRecordAt(0, []byte("zeroth"))
+	if !ok {
+		t.Fatal("InsertRecordAt at index 0 returned false")
+	}
+
+	want := [][]byte{[]byte("zeroth"), []byte("first"), []byte("second")}
+	for i, w := range want {
+		got, ok := p.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) returned false after insert at 0", i)
+		}
+		if !bytes.Equal(got, w) {
+			t.Errorf("GetRecord(%d) = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestInsertRecordAt_AtMiddle_ShiftsHigherSlots(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("a"))
+	p.InsertRecord([]byte("c"))
+	p.InsertRecord([]byte("d"))
+
+	ok := p.InsertRecordAt(1, []byte("b"))
+	if !ok {
+		t.Fatal("InsertRecordAt at middle returned false")
+	}
+
+	want := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d")}
+	for i, w := range want {
+		got, ok := p.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) returned false", i)
+		}
+		if !bytes.Equal(got, w) {
+			t.Errorf("GetRecord(%d) = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestInsertRecordAt_IntoEmptyPage_AtIndexZero(t *testing.T) {
+	p := newTestPage(t, 1)
+
+	ok := p.InsertRecordAt(0, []byte("only"))
+	if !ok {
+		t.Fatal("InsertRecordAt(0) on empty page returned false")
+	}
+	if got := p.GetRowCount(); got != 1 {
+		t.Errorf("RowCount = %d, want 1", got)
+	}
+	got, ok := p.GetRecord(0)
+	if !ok || !bytes.Equal(got, []byte("only")) {
+		t.Errorf("GetRecord(0) = %q ok=%v, want %q true", got, ok, "only")
+	}
+}
+
+func TestInsertRecordAt_IncrementsRowCount(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("x"))
+	p.InsertRecord([]byte("z"))
+
+	before := p.GetRowCount()
+	p.InsertRecordAt(1, []byte("y"))
+	if got := p.GetRowCount(); got != before+1 {
+		t.Errorf("RowCount = %d, want %d", got, before+1)
+	}
+}
+
+func TestInsertRecordAt_IncreasesFreeSpaceStart(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("a"))
+	before := p.GetFreeSpaceStart()
+
+	p.InsertRecordAt(0, []byte("b"))
+
+	if got := p.GetFreeSpaceStart(); got <= before {
+		t.Errorf("FreeSpaceStart should increase: before=%d after=%d", before, got)
+	}
+}
+
+func TestInsertRecordAt_DecreasesFreeSpaceEnd(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("a"))
+	before := p.GetFreeSpaceEnd()
+
+	p.InsertRecordAt(0, []byte("b"))
+
+	if got := p.GetFreeSpaceEnd(); got >= before {
+		t.Errorf("FreeSpaceEnd should decrease: before=%d after=%d", before, got)
+	}
+}
+
+func TestInsertRecordAt_ReturnsFalseWhenFull(t *testing.T) {
+	p := newTestPage(t, 1)
+	filler := make([]byte, 100)
+	for p.CanAccommodate(len(filler)) {
+		p.InsertRecord(filler)
+	}
+	// Use same size so we're certain it won't fit (leftover gap < 104 bytes).
+	if p.InsertRecordAt(0, filler) {
+		t.Error("InsertRecordAt should return false when page cannot fit the record")
+	}
+}
+
+func TestInsertRecordAt_PanicsOnNegativeIndex(t *testing.T) {
+	p := newTestPage(t, 1)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative slot index")
+		}
+	}()
+	p.InsertRecordAt(-1, []byte("x"))
+}
+
+func TestInsertRecordAt_PanicsOnIndexBeyondRowCount(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("a"))
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for slotIndex > rowCount")
+		}
+	}()
+	p.InsertRecordAt(2, []byte("x"))
+}
+
+func TestInsertRecordAt_PanicsOnMetaPage(t *testing.T) {
+	p := NewMetaPage()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic when inserting into meta page")
+		}
+	}()
+	p.InsertRecordAt(0, []byte("x"))
+}
+
+func TestInsertRecordAt_PanicsOnOverflowPage(t *testing.T) {
+	p := NewPage(PageTypeOverflow, 1)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic when inserting into overflow page")
+		}
+	}()
+	p.InsertRecordAt(0, []byte("x"))
+}
+
+func TestInsertRecordAt_DoesNotCorruptLeafSiblings(t *testing.T) {
+	p := NewLeafPage(1, 10, 20)
+	p.InsertRecord([]byte("a"))
+	p.InsertRecord([]byte("c"))
+
+	p.InsertRecordAt(1, []byte("b"))
+
+	if got := p.GetLeftSibling(); got != 10 {
+		t.Errorf("GetLeftSibling() = %d after InsertRecordAt, want 10", got)
+	}
+	if got := p.GetRightSibling(); got != 20 {
+		t.Errorf("GetRightSibling() = %d after InsertRecordAt, want 20", got)
+	}
+}
+
+func TestInsertRecordAt_MultipleInsertsPreserveOrder(t *testing.T) {
+	p := newTestPage(t, 1)
+	// Build sorted sequence by always inserting at the right position
+	p.InsertRecord([]byte("b"))
+	p.InsertRecordAt(0, []byte("a")) // insert before "b"
+	p.InsertRecordAt(2, []byte("d")) // append after "b"
+	p.InsertRecordAt(2, []byte("c")) // insert before "d"
+
+	want := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d")}
+	if got := p.GetRowCount(); int(got) != len(want) {
+		t.Fatalf("RowCount = %d, want %d", got, len(want))
+	}
+	for i, w := range want {
+		got, ok := p.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) returned false", i)
+		}
+		if !bytes.Equal(got, w) {
+			t.Errorf("GetRecord(%d) = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestInsertRecordAt_FreeSpaceStartEqualsHeaderPlusSlots(t *testing.T) {
+	p := newTestPage(t, 1)
+	p.InsertRecord([]byte("x"))
+	p.InsertRecord([]byte("z"))
+
+	p.InsertRecordAt(1, []byte("y"))
+
+	rowCount := int(p.GetRowCount())
+	expected := uint16(p.headerSize() + rowCount*4)
+	if got := p.GetFreeSpaceStart(); got != expected {
+		t.Errorf("FreeSpaceStart = %d, want %d (headerSize + rowCount*4)", got, expected)
+	}
+}
+
+// ============================================================
 // DeleteRecord
 // ============================================================
 
