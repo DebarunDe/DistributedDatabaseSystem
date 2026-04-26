@@ -9008,7 +9008,9 @@ func TestHandleUnderflow_RootNotCollapsed_WhenRootHasEntries(t *testing.T) {
 	root.InsertRecord(EncodeInternalRecord(200, midId))
 
 	for _, p := range []*pagemanager.Page{leftLeaf, midLeaf, rightLeaf, root} {
-		pm.WritePage(p)
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
 	}
 	if err := pm.SetRootPageId(rootId); err != nil {
 		t.Fatalf("SetRootPageId: %v", err)
@@ -9159,7 +9161,9 @@ func TestHandleUnderflow_MergeError_PropagatesFromLeaf(t *testing.T) {
 	// GetRecord(-1) → last slot of 0-row page → that returns (nil, false) →
 	// DecodInternalRecord will fail → handleUnderflow returns an error.
 	for _, p := range []*pagemanager.Page{leftLeaf, rightLeaf, parent} {
-		pm.WritePage(p)
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
 	}
 
 	bt := NewBTree(pm)
