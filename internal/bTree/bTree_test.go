@@ -4224,7 +4224,6 @@ func assertMissing(t *testing.T, bt *BTree, key uint64) {
 	}
 }
 
-
 // verifyLeafChain walks the leaf sibling chain and asserts that every key in
 // wantKeys appears exactly once, in ascending order, with no holes.
 func verifyLeafChain(t *testing.T, bt *BTree, pm pagemanager.PageManager, wantKeys []uint64) {
