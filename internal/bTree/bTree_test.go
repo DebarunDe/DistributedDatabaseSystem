@@ -8319,7 +8319,9 @@ func TestHandleUnderflow_Leaf_Merge_SiblingChainUpdated(t *testing.T) {
 	parent.InsertRecord(EncodeInternalRecord(100, sibId))
 
 	for _, p := range []*pagemanager.Page{page, sibling, beyond, parent} {
-		pm.WritePage(p)
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
 	}
 
 	bt := NewBTree(pm)
@@ -8894,7 +8896,9 @@ func TestHandleUnderflow_RootCollapse_Internal(t *testing.T) {
 	root.InsertRecord(EncodeInternalRecord(50, leftId))
 
 	for _, p := range []*pagemanager.Page{leftInt, rightInt, root} {
-		pm.WritePage(p)
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
 	}
 	if err := pm.SetRootPageId(rootId); err != nil {
 		t.Fatalf("SetRootPageId: %v", err)
@@ -8943,7 +8947,9 @@ func TestHandleUnderflow_RootCollapse_Internal_RightSibling(t *testing.T) {
 	root.InsertRecord(EncodeInternalRecord(50, leftId))
 
 	for _, p := range []*pagemanager.Page{leftInt, rightInt, root} {
-		pm.WritePage(p)
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
 	}
 	if err := pm.SetRootPageId(rootId); err != nil {
 		t.Fatalf("SetRootPageId: %v", err)

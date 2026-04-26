@@ -335,7 +335,9 @@ func (bt *BTree) insertIntoParent(leftPage *pagemanager.Page, separatorKey uint6
 		if err := bt.pm.WritePage(newRoot); err != nil {
 			return fmt.Errorf("failed to write new root page: %w", err)
 		}
-		bt.pm.SetRootPageId(newRoot.GetPageId())
+		if err := bt.pm.SetRootPageId(newRoot.GetPageId()); err != nil {
+			return fmt.Errorf("failed to set root page ID: %w", err)
+		}
 		return nil
 	}
 
