@@ -4187,7 +4187,7 @@ func newTempBTree(t *testing.T) (*BTree, pagemanager.PageManager) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 	return NewBTree(pm), pm
 }
 
@@ -4224,13 +4224,6 @@ func assertMissing(t *testing.T, bt *BTree, key uint64) {
 	}
 }
 
-// verifyAllKeys checks that every entry in inserted can be found with its correct fields.
-func verifyAllKeys(t *testing.T, bt *BTree, inserted map[uint64][]Field) {
-	t.Helper()
-	for k, fields := range inserted {
-		assertFound(t, bt, k, fields)
-	}
-}
 
 // verifyLeafChain walks the leaf sibling chain and asserts that every key in
 // wantKeys appears exactly once, in ascending order, with no holes.
@@ -5156,7 +5149,7 @@ func setupRedistLeaf(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err = pm.AllocatePage()
 	if err != nil {
@@ -5521,7 +5514,7 @@ func TestRedistributeLeaf_RecordValuesIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 	bt := NewBTree(pm)
 
 	leftPage, _ := pm.AllocatePage()
@@ -5547,9 +5540,15 @@ func TestRedistributeLeaf_RecordValuesIntact(t *testing.T) {
 	parentPage, _ := pm.AllocatePage()
 	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, rightId)
 	parentPage.InsertRecord(EncodeInternalRecord(3, leftId))
-	pm.WritePage(leftPage)
-	pm.WritePage(rightPage)
-	pm.WritePage(parentPage)
+	if err := pm.WritePage(leftPage); err != nil {
+		t.Fatalf("WritePage(leftPage): %v", err)
+	}
+	if err := pm.WritePage(rightPage); err != nil {
+		t.Fatalf("WritePage(rightPage): %v", err)
+	}
+	if err := pm.WritePage(parentPage); err != nil {
+		t.Fatalf("WritePage(parentPage): %v", err)
+	}
 
 	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
 		t.Fatalf("redistributeLeaf: %v", err)
@@ -5609,7 +5608,7 @@ func TestRedistributeLeaf_MultipleChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 	bt := NewBTree(pm)
 
 	alloc := func() *pagemanager.Page {
@@ -5755,7 +5754,7 @@ func setupRedistInternal(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err = pm.AllocatePage()
 	if err != nil {
@@ -6320,7 +6319,7 @@ func TestRedistributeInternal_MultipleChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 	bt := NewBTree(pm)
 
 	alloc := func() *pagemanager.Page {
@@ -6433,7 +6432,7 @@ func setupMergeLeaf(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err = pm.AllocatePage()
 	if err != nil {
@@ -6760,7 +6759,7 @@ func TestMergeLeaf_ParentHasFourChildren_NotRightMost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	alloc := func() *pagemanager.Page {
 		p, e := pm.AllocatePage()
@@ -6888,7 +6887,7 @@ func setupMergeLeafEncoded(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err = pm.AllocatePage()
 	if err != nil {
@@ -6963,7 +6962,9 @@ func TestMergeLeaf_SearchConsistency_RightMost(t *testing.T) {
 	rightKeys := []uint64{40, 50}
 
 	bt, pm, leftPage, rightPage, parentPage := setupMergeLeafEncoded(t, leftKeys, rightKeys, true)
-	pm.SetRootPageId(parentPage.GetPageId())
+	if err := pm.SetRootPageId(parentPage.GetPageId()); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
 
 	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
 		t.Fatalf("mergeLeaf: %v", err)
@@ -7001,7 +7002,9 @@ func TestMergeLeaf_SearchConsistency_NotRightMost(t *testing.T) {
 		t.Fatalf("WritePage(ceil): %v", err)
 	}
 
-	pm.SetRootPageId(parentPage.GetPageId())
+	if err := pm.SetRootPageId(parentPage.GetPageId()); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
 
 	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
 		t.Fatalf("mergeLeaf: %v", err)
@@ -7044,7 +7047,7 @@ func setupMergeInternal(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err = pm.AllocatePage()
 	if err != nil {
@@ -7452,7 +7455,7 @@ func TestMergeInternal_MultipleChildren_NotRightMost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	floorPage, err := pm.AllocatePage()
 	if err != nil {
@@ -7557,7 +7560,7 @@ func TestMergeInternal_NoParentSep_ReturnsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftPage, err := pm.AllocatePage()
 	if err != nil {
@@ -7624,7 +7627,7 @@ func TestHandleUnderflow_NoOp_DenseLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -7659,7 +7662,7 @@ func TestHandleUnderflow_NoOp_DenseInternal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -7693,7 +7696,7 @@ func TestHandleUnderflow_NoOp_ExactThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -7739,7 +7742,7 @@ func TestHandleUnderflow_Root_SparseLeaf_NoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -7772,7 +7775,7 @@ func TestHandleUnderflow_Root_SparseInternal_NoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -7812,7 +7815,7 @@ func setupHULeafRedistRight(t *testing.T, pageKeys []uint64) (bt *BTree, pm page
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -7870,7 +7873,7 @@ func setupHULeafRedistLeft(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagem
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8013,10 +8016,7 @@ func TestHandleUnderflow_Leaf_Redistribute_AllOriginalKeysPresent(t *testing.T) 
 	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
 
 	// Collect the original keys from the sibling before the call.
-	var wantKeys []uint64
-	for _, k := range []uint64{1, 2, 3} {
-		wantKeys = append(wantKeys, k)
-	}
+	wantKeys := []uint64{1, 2, 3}
 	for i := 0; i < 10; i++ {
 		wantKeys = append(wantKeys, uint64(1000+i*10))
 	}
@@ -8103,7 +8103,7 @@ func setupHULeafMergeRight(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagem
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8156,7 +8156,7 @@ func setupHULeafMergeLeft(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagema
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8297,7 +8297,7 @@ func TestHandleUnderflow_Leaf_Merge_SiblingChainUpdated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, _ := pm.AllocatePage()
 	sibling, _ := pm.AllocatePage()
@@ -8378,7 +8378,7 @@ func setupHUInternalRedistRight(t *testing.T) (bt *BTree, pm pagemanager.PageMan
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8423,7 +8423,7 @@ func setupHUInternalRedistLeft(t *testing.T) (bt *BTree, pm pagemanager.PageMana
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8562,7 +8562,7 @@ func setupHUInternalMergeRight(t *testing.T) (bt *BTree, pm pagemanager.PageMana
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8607,7 +8607,7 @@ func setupHUInternalMergeLeft(t *testing.T) (bt *BTree, pm pagemanager.PageManag
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	page, err = pm.AllocatePage()
 	if err != nil {
@@ -8735,7 +8735,7 @@ func setupRootCollapseLeaf(
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftLeaf, err := pm.AllocatePage()
 	if err != nil {
@@ -8876,7 +8876,7 @@ func TestHandleUnderflow_RootCollapse_Internal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftInt, _ := pm.AllocatePage()
 	rightInt, _ := pm.AllocatePage()
@@ -8926,7 +8926,7 @@ func TestHandleUnderflow_RootCollapse_Internal_RightSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftInt, _ := pm.AllocatePage()
 	rightInt, _ := pm.AllocatePage()
@@ -8975,7 +8975,7 @@ func TestHandleUnderflow_RootNotCollapsed_WhenRootHasEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	// Root has 3 leaf children; merging two of them leaves 1 slot + rmc in root.
 	leftLeaf, _ := pm.AllocatePage()
@@ -9042,7 +9042,7 @@ func TestHandleUnderflow_RecursiveParentUnderflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftLeaf, _ := pm.AllocatePage()
 	rightLeaf, _ := pm.AllocatePage()
@@ -9125,7 +9125,7 @@ func TestHandleUnderflow_MergeError_PropagatesFromLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	t.Cleanup(func() { pm.Delete() })
+	t.Cleanup(func() { _ = pm.Delete() })
 
 	leftLeaf, _ := pm.AllocatePage()
 	rightLeaf, _ := pm.AllocatePage()

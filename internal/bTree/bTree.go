@@ -956,7 +956,9 @@ func (bt *BTree) Insert(key uint64, fields []Field) error {
 			return fmt.Errorf("failed to write new root page: %w", err)
 		}
 
-		bt.pm.SetRootPageId(newRoot.GetPageId())
+		if err := bt.pm.SetRootPageId(newRoot.GetPageId()); err != nil {
+			return fmt.Errorf("failed to set root page ID: %w", err)
+		}
 		return nil
 	}
 
@@ -1051,7 +1053,9 @@ func (bt *BTree) Delete(key uint64) error {
 			if err := bt.pm.FreePage(leafPage.GetPageId()); err != nil {
 				return fmt.Errorf("failed to free root page: %w", err)
 			}
-			bt.pm.SetRootPageId(pagemanager.InvalidPageID)
+			if err := bt.pm.SetRootPageId(pagemanager.InvalidPageID); err != nil {
+				return fmt.Errorf("failed to reset root page ID: %w", err)
+			}
 		} else {
 			// Just write the updated root page.
 			if err := bt.pm.WritePage(leafPage); err != nil {
