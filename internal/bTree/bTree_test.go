@@ -9843,3 +9843,460 @@ func TestDelete_ThenInsertSameRange(t *testing.T) {
 	}
 	verifyLeafChain(t, bt, pm, fullKeys)
 }
+
+// ── RangeScan tests ───────────────────────────────────────────────────────────
+
+// mustRangeScan calls RangeScan and fatals on error.
+func mustRangeScan(t *testing.T, bt *BTree, start, end uint64) []struct {
+	Key    uint64
+	Fields []Field
+} {
+	t.Helper()
+	results, err := bt.RangeScan(start, end)
+	if err != nil {
+		t.Fatalf("RangeScan(%d, %d): %v", start, end, err)
+	}
+	return results
+}
+
+// assertRangeScanKeys asserts that the returned results have exactly the given
+// keys, in ascending order.
+func assertRangeScanKeys(t *testing.T, results []struct {
+	Key    uint64
+	Fields []Field
+}, want []uint64) {
+	t.Helper()
+	if len(results) != len(want) {
+		got := make([]uint64, len(results))
+		for i, r := range results {
+			got[i] = r.Key
+		}
+		t.Fatalf("RangeScan key count: got %v, want %v", got, want)
+	}
+	for i, r := range results {
+		if r.Key != want[i] {
+			t.Errorf("results[%d].Key = %d, want %d", i, r.Key, want[i])
+		}
+	}
+}
+
+// assertRangeScanAscending verifies that the returned keys are strictly
+// ascending — no duplicates, no out-of-order keys.
+func assertRangeScanAscending(t *testing.T, results []struct {
+	Key    uint64
+	Fields []Field
+}) {
+	t.Helper()
+	for i := 1; i < len(results); i++ {
+		if results[i].Key <= results[i-1].Key {
+			t.Errorf("results not ascending at index %d: %d <= %d",
+				i, results[i].Key, results[i-1].Key)
+		}
+	}
+}
+
+// TestRangeScan_EmptyTree returns nil when the tree has no records.
+func TestRangeScan_EmptyTree(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	results, err := bt.RangeScan(1, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if results != nil {
+		t.Fatalf("expected nil, got %v", results)
+	}
+}
+
+// TestRangeScan_SingleKey_Hit range contains exactly one key that exists.
+func TestRangeScan_SingleKey_Hit(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 42, []Field{intF(1, 42)})
+
+	results := mustRangeScan(t, bt, 42, 42)
+	assertRangeScanKeys(t, results, []uint64{42})
+	if results[0].Fields[0].Value != (IntValue{V: 42}) {
+		t.Errorf("unexpected field value: %v", results[0].Fields[0].Value)
+	}
+}
+
+// TestRangeScan_SingleKey_Miss range covers one value that does not exist.
+func TestRangeScan_SingleKey_Miss(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 10, []Field{intF(1, 10)})
+	mustInsert(t, bt, 20, []Field{intF(1, 20)})
+
+	results := mustRangeScan(t, bt, 15, 15)
+	assertRangeScanKeys(t, results, []uint64{})
+}
+
+// TestRangeScan_InvertedRange startKey > endKey returns no results.
+func TestRangeScan_InvertedRange(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(1); i <= 10; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 8, 3)
+	assertRangeScanKeys(t, results, []uint64{})
+}
+
+// TestRangeScan_AllKeys range covers the entire tree.
+func TestRangeScan_AllKeys(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 10
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 1, n)
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestRangeScan_PartialRange returns only keys within the requested sub-range.
+func TestRangeScan_PartialRange(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(1); i <= 20; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 5, 15)
+	want := make([]uint64, 11)
+	for i := range want {
+		want[i] = uint64(5 + i)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestRangeScan_StartKeyAboveAll startKey is larger than every stored key → empty.
+func TestRangeScan_StartKeyAboveAll(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(1); i <= 10; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 100, 200)
+	assertRangeScanKeys(t, results, []uint64{})
+}
+
+// TestRangeScan_EndKeyBelowAll endKey is smaller than every stored key → empty.
+func TestRangeScan_EndKeyBelowAll(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(10); i <= 20; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 1, 5)
+	assertRangeScanKeys(t, results, []uint64{})
+}
+
+// TestRangeScan_BoundaryInclusive_Start startKey matches an existing record exactly.
+func TestRangeScan_BoundaryInclusive_Start(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30, 40, 50} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 20, 50)
+	assertRangeScanKeys(t, results, []uint64{20, 30, 40, 50})
+}
+
+// TestRangeScan_BoundaryInclusive_End endKey matches an existing record exactly.
+func TestRangeScan_BoundaryInclusive_End(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30, 40, 50} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 10, 40)
+	assertRangeScanKeys(t, results, []uint64{10, 20, 30, 40})
+}
+
+// TestRangeScan_GapAtBothBoundaries startKey and endKey fall in gaps between stored keys.
+func TestRangeScan_GapAtBothBoundaries(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30, 40, 50} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	// [15, 45] → should hit 20, 30, 40
+	results := mustRangeScan(t, bt, 15, 45)
+	assertRangeScanKeys(t, results, []uint64{20, 30, 40})
+}
+
+// TestRangeScan_StartBeforeAll startKey is below every key; returns all keys <= endKey.
+func TestRangeScan_StartBeforeAll(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30, 40, 50} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 1, 30)
+	assertRangeScanKeys(t, results, []uint64{10, 20, 30})
+}
+
+// TestRangeScan_EndAfterAll endKey is above every key; returns all keys >= startKey.
+func TestRangeScan_EndAfterAll(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30, 40, 50} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 30, 1000)
+	assertRangeScanKeys(t, results, []uint64{30, 40, 50})
+}
+
+// TestRangeScan_FullOpenRange [0, MaxUint64] returns every key in the tree.
+func TestRangeScan_FullOpenRange(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 15
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 0, ^uint64(0))
+	if len(results) != n {
+		t.Fatalf("expected %d results, got %d", n, len(results))
+	}
+	assertRangeScanAscending(t, results)
+}
+
+// TestRangeScan_KeyZero the minimum possible key is included when in range.
+func TestRangeScan_KeyZero(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 0, []Field{intF(1, 0)})
+	mustInsert(t, bt, 1, []Field{intF(1, 1)})
+	mustInsert(t, bt, 2, []Field{intF(1, 2)})
+
+	results := mustRangeScan(t, bt, 0, 1)
+	assertRangeScanKeys(t, results, []uint64{0, 1})
+}
+
+// TestRangeScan_MaxUint64 the maximum possible key is included when in range.
+func TestRangeScan_MaxUint64(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	maxKey := ^uint64(0)
+	mustInsert(t, bt, maxKey-1, []Field{intF(1, 1)})
+	mustInsert(t, bt, maxKey, []Field{intF(1, 2)})
+
+	results := mustRangeScan(t, bt, maxKey, maxKey)
+	assertRangeScanKeys(t, results, []uint64{maxKey})
+}
+
+// TestRangeScan_MultiPage range spans multiple leaf pages.
+func TestRangeScan_MultiPage(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 200
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 50, 150)
+	want := make([]uint64, 101)
+	for i := range want {
+		want[i] = uint64(50 + i)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestRangeScan_MultiPage_AllKeys range covers all keys over many leaf pages.
+func TestRangeScan_MultiPage_AllKeys(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 300
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 1, n)
+	if len(results) != n {
+		t.Fatalf("expected %d results, got %d", n, len(results))
+	}
+	assertRangeScanAscending(t, results)
+	for i, r := range results {
+		if r.Key != uint64(i+1) {
+			t.Errorf("results[%d].Key = %d, want %d", i, r.Key, i+1)
+		}
+	}
+}
+
+// TestRangeScan_ResultsAscending verifies strict ascending order when keys were
+// inserted in reverse order.
+func TestRangeScan_ResultsAscending(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(100); i >= 1; i-- {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	results := mustRangeScan(t, bt, 10, 90)
+	assertRangeScanAscending(t, results)
+	if len(results) != 81 {
+		t.Fatalf("expected 81 results, got %d", len(results))
+	}
+}
+
+// TestRangeScan_FieldValues verifies that the correct field values are returned
+// for each key, not just the keys themselves.
+func TestRangeScan_FieldValues(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 1, []Field{strF(1, "one")})
+	mustInsert(t, bt, 2, []Field{strF(1, "two")})
+	mustInsert(t, bt, 3, []Field{strF(1, "three")})
+
+	results := mustRangeScan(t, bt, 1, 3)
+	assertRangeScanKeys(t, results, []uint64{1, 2, 3})
+
+	wantStrs := []string{"one", "two", "three"}
+	for i, r := range results {
+		sv, ok := r.Fields[0].Value.(StringValue)
+		if !ok {
+			t.Fatalf("results[%d].Fields[0].Value is not StringValue", i)
+		}
+		if sv.V != wantStrs[i] {
+			t.Errorf("results[%d] value = %q, want %q", i, sv.V, wantStrs[i])
+		}
+	}
+}
+
+// TestRangeScan_AfterDelete range scan reflects deletions correctly.
+func TestRangeScan_AfterDelete(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for i := uint64(1); i <= 20; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	// Delete even keys
+	for i := uint64(2); i <= 20; i += 2 {
+		mustDelete(t, bt, i)
+	}
+
+	results := mustRangeScan(t, bt, 1, 20)
+	want := make([]uint64, 10)
+	for i := range want {
+		want[i] = uint64(2*i + 1)
+	}
+	assertRangeScanKeys(t, results, want)
+}
+
+// TestRangeScan_AfterUpdate verifies that an updated key returns the new fields.
+func TestRangeScan_AfterUpdate(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 5, []Field{intF(1, 100)})
+	mustInsert(t, bt, 5, []Field{intF(1, 999)}) // overwrite
+
+	results := mustRangeScan(t, bt, 5, 5)
+	assertRangeScanKeys(t, results, []uint64{5})
+	if results[0].Fields[0].Value != (IntValue{V: 999}) {
+		t.Errorf("expected updated value 999, got %v", results[0].Fields[0].Value)
+	}
+}
+
+// TestRangeScan_SparseKeys keys have large gaps; range returns only those within [start, end].
+func TestRangeScan_SparseKeys(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	sparse := []uint64{100, 200, 300, 400, 500, 1000, 2000, 5000}
+	for _, k := range sparse {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 150, 1500)
+	assertRangeScanKeys(t, results, []uint64{200, 300, 400, 500, 1000})
+}
+
+// TestRangeScan_ExactlyOnePage inserts just enough records to stay on one leaf
+// page, and verifies a sub-range scan within that single page.
+func TestRangeScan_ExactlyOnePage(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{1, 3, 5, 7, 9} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 3, 7)
+	assertRangeScanKeys(t, results, []uint64{3, 5, 7})
+}
+
+// TestRangeScan_NonContiguousKeys range that covers keys not all stored; only
+// stored keys within the range are returned.
+func TestRangeScan_NonContiguousKeys(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{5, 10, 15, 25, 35} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	// Range [8, 30] should return 10, 15, 25
+	results := mustRangeScan(t, bt, 8, 30)
+	assertRangeScanKeys(t, results, []uint64{10, 15, 25})
+}
+
+// TestRangeScan_LargeTree_CorrectCount inserts a large number of records and
+// verifies the exact count returned for a specific range.
+func TestRangeScan_LargeTree_CorrectCount(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 500
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	// [101, 400] → 300 records
+	results := mustRangeScan(t, bt, 101, 400)
+	if len(results) != 300 {
+		t.Fatalf("expected 300 results, got %d", len(results))
+	}
+	assertRangeScanAscending(t, results)
+	if results[0].Key != 101 {
+		t.Errorf("first key = %d, want 101", results[0].Key)
+	}
+	if results[len(results)-1].Key != 400 {
+		t.Errorf("last key = %d, want 400", results[len(results)-1].Key)
+	}
+}
+
+// TestRangeScan_RandomOrder inserts keys in random order and verifies results
+// are still returned in ascending order.
+func TestRangeScan_RandomOrder(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	// Insert in a non-sequential order
+	keys := []uint64{50, 10, 80, 30, 70, 20, 60, 40, 90, 100, 5, 15, 25, 35, 45}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+
+	results := mustRangeScan(t, bt, 20, 70)
+	assertRangeScanAscending(t, results)
+
+	// Collect expected keys: those from `keys` in [20,70], sorted
+	var want []uint64
+	for _, k := range keys {
+		if k >= 20 && k <= 70 {
+			want = append(want, k)
+		}
+	}
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+	assertRangeScanKeys(t, results, want)
+}
+
+// TestRangeScan_ConsistentWithSearch verifies that for every key returned by
+// RangeScan, a direct Search returns the same fields.
+func TestRangeScan_ConsistentWithSearch(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	const n = 100
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i)), strF(2, fmt.Sprintf("v%d", i))})
+	}
+
+	results := mustRangeScan(t, bt, 30, 70)
+	for _, r := range results {
+		fields, found, err := bt.Search(r.Key)
+		if err != nil {
+			t.Fatalf("Search(%d): %v", r.Key, err)
+		}
+		if !found {
+			t.Fatalf("key %d found in RangeScan but not in Search", r.Key)
+		}
+		assertFields(t, r.Fields, fields)
+	}
+}

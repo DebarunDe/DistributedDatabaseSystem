@@ -1079,3 +1079,66 @@ func (bt *BTree) Delete(key uint64) error {
 		return bt.handleUnderflow(leafPage, path)
 	}
 }
+
+// RangeScan returns all records with keys in the range [startKey, endKey], inclusive. It traverses the leaf pages starting from the leaf page containing startKey and continues until it has passed endKey, collecting records along the way.
+func (bt *BTree) RangeScan(startKey, endKey uint64) ([]struct {
+	Key    uint64
+	Fields []Field
+}, error) {
+
+	if bt.pm.GetRootPageId() == pagemanager.InvalidPageID {
+		// Tree is empty, return empty result.
+		return nil, nil
+	}
+
+	rootPage, err := bt.pm.ReadPage(bt.pm.GetRootPageId())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read root page: %w", err)
+	}
+
+	leafPage, err := bt.findLeaf(startKey, rootPage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find starting leaf page: %w", err)
+	}
+
+	results := make([]struct {
+		Key    uint64
+		Fields []Field
+	}, 0)
+
+	for leafPage.GetPageId() != pagemanager.InvalidPageID {
+		for i := 0; i < int(leafPage.GetRowCount()); i++ {
+			raw, _ := leafPage.GetRecord(i)
+			recKey, fields, err := DecodeLeafRecord(raw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode leaf record: %w", err)
+			}
+
+			if recKey > endKey {
+				return results, nil
+			}
+
+			if recKey >= startKey {
+				results = append(results, struct {
+					Key    uint64
+					Fields []Field
+				}{
+					Key:    recKey,
+					Fields: fields,
+				})
+			}
+		}
+
+		nextPageId := leafPage.GetRightSibling()
+		if nextPageId == pagemanager.InvalidPageID {
+			break
+		}
+
+		leafPage, err = bt.pm.ReadPage(nextPageId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read next leaf page: %w", err)
+		}
+	}
+
+	return results, nil
+}
