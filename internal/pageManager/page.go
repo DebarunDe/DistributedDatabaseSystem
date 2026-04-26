@@ -371,6 +371,20 @@ func (p *Page) DeleteRecord(slotIndex int) {
 	p.setSlotLength(slotIndex, 0, false)
 }
 
+func (p *Page) ClearRecords() {
+	if p.GetPageType() == PageTypeMeta || p.GetPageType() == PageTypeOverflow {
+		panic("cannot clear records of meta/overflow pages")
+	}
+
+	rowCount := p.GetRowCount()
+	for i := 0; i < int(rowCount); i++ {
+		p.DeleteRecord(i)
+	}
+	p.setRowCount(0)
+	p.setFreeSpaceStart(uint16(p.headerSize()))
+	p.setFreeSpaceEnd(PageSize)
+}
+
 func (p *Page) updateRecord(slotIndex int, record []byte, overflow bool) bool {
 	if len(record) > 0x7FFF {
 		panic("Record too large for slot")

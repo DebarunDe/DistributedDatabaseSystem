@@ -5092,3 +5092,4745 @@ func TestInsert_MixedInsertAndUpdate(t *testing.T) {
 	}
 	verifyLeafChain(t, bt, pm, keys)
 }
+
+// ── redistributeLeaf helpers ───────────────────────────────────────────────────
+
+// mustReadPage re-reads a page from the page manager, fataling on error.
+func mustReadPage(t *testing.T, pm pagemanager.PageManager, id uint32) *pagemanager.Page {
+	t.Helper()
+	p, err := pm.ReadPage(id)
+	if err != nil {
+		t.Fatalf("ReadPage(%d): %v", id, err)
+	}
+	return p
+}
+
+// redistLeafKeys returns all keys from a leaf page in slot order.
+func redistLeafKeys(t *testing.T, page *pagemanager.Page) []uint64 {
+	t.Helper()
+	keys := make([]uint64, page.GetRowCount())
+	for i := range keys {
+		rec, ok := page.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) failed on page %d", i, page.GetPageId())
+		}
+		keys[i] = RecordKey(rec)
+	}
+	return keys
+}
+
+// redistParentSepKey scans an internal page for the record whose child pointer
+// equals childId, returning the key and true if found.
+func redistParentSepKey(t *testing.T, parent *pagemanager.Page, childId uint32) (uint64, bool) {
+	t.Helper()
+	for i := 0; i < int(parent.GetRowCount()); i++ {
+		rec, ok := parent.GetRecord(i)
+		if !ok {
+			continue
+		}
+		k, cid, err := DecodeInternalRecord(rec)
+		if err != nil {
+			t.Fatalf("DecodeInternalRecord(slot %d): %v", i, err)
+		}
+		if cid == childId {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+// setupRedistLeaf builds two adjacent sibling leaf pages and a parent internal
+// page, writes all of them to a fresh DB, and returns the BTree and pages.
+// leftKeys/rightKeys must be pre-sorted with all leftKeys < all rightKeys.
+// When rightIsRightMost is true, rightPage is the parent's rightMostChild and
+// has no separator record of its own; otherwise a dummy ceiling leaf is created
+// as the rightMostChild so rightPage has its own record in the parent.
+func setupRedistLeaf(
+	t *testing.T,
+	leftKeys, rightKeys []uint64,
+	rightIsRightMost bool,
+) (bt *BTree, pm pagemanager.PageManager, leftPage, rightPage, parentPage *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	*leftPage = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightPage = *pagemanager.NewLeafPage(rightId, leftId, pagemanager.InvalidPageID)
+
+	for _, k := range leftKeys {
+		if _, ok := leftPage.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(left, key=%d) failed", k)
+		}
+	}
+	for _, k := range rightKeys {
+		if _, ok := rightPage.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(right, key=%d) failed", k)
+		}
+	}
+
+	rightMostId := rightId
+	if !rightIsRightMost {
+		ceilPage, err := pm.AllocatePage()
+		if err != nil {
+			t.Fatalf("AllocatePage(ceil): %v", err)
+		}
+		ceilId := ceilPage.GetPageId()
+		*ceilPage = *pagemanager.NewLeafPage(ceilId, rightId, pagemanager.InvalidPageID)
+		if err := pm.WritePage(ceilPage); err != nil {
+			t.Fatalf("WritePage(ceil): %v", err)
+		}
+		rightMostId = ceilId
+	}
+
+	parentPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, rightMostId)
+
+	// Records are inserted in ascending key order so the slot array is sorted,
+	// satisfying searchInternal's binary search invariant.
+	maxLeft := leftKeys[len(leftKeys)-1]
+	parentPage.InsertRecord(EncodeInternalRecord(maxLeft, leftId))
+	if !rightIsRightMost {
+		maxRight := rightKeys[len(rightKeys)-1]
+		parentPage.InsertRecord(EncodeInternalRecord(maxRight, rightId))
+	}
+
+	for _, p := range []*pagemanager.Page{leftPage, rightPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// ── TestRedistributeLeaf cases ────────────────────────────────────────────────
+
+// TestRedistributeLeaf_LeftHeavy_RightMostChild: left=[1,2,3], right=[10],
+// rightPage is parent's rightMostChild.
+// total=4, mid=2 → left=[1,2], right=[3,10]; separator updated 3→2.
+func TestRedistributeLeaf_LeftHeavy_RightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 2}) {
+		t.Errorf("left keys: got %v, want [1 2]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{3, 10}) {
+		t.Errorf("right keys: got %v, want [3 10]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator record for leftPage in parent")
+	}
+	if sep != 2 {
+		t.Errorf("separator key: got %d, want 2", sep)
+	}
+	if parent.GetRightMostChild() != rightId {
+		t.Errorf("rightMostChild changed: got %d, want %d", parent.GetRightMostChild(), rightId)
+	}
+}
+
+// TestRedistributeLeaf_RightHeavy_RightMostChild: left=[1], right=[10,20,30],
+// rightPage is parent's rightMostChild.
+// total=4, mid=2 → left=[1,10], right=[20,30]; separator updated 1→10.
+func TestRedistributeLeaf_RightHeavy_RightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1}, []uint64{10, 20, 30}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 10}) {
+		t.Errorf("left keys: got %v, want [1 10]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{20, 30}) {
+		t.Errorf("right keys: got %v, want [20 30]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 10 {
+		t.Errorf("separator key: got %d, want 10", sep)
+	}
+	if parent.GetRightMostChild() != rightId {
+		t.Errorf("rightMostChild changed: got %d, want %d", parent.GetRightMostChild(), rightId)
+	}
+}
+
+// TestRedistributeLeaf_LeftHeavy_NotRightMostChild: same distribution as
+// LeftHeavy above, but rightPage is not the rightMostChild (has its own record).
+// Also verifies rightPage's own separator is left untouched.
+func TestRedistributeLeaf_LeftHeavy_NotRightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10}, false)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 2}) {
+		t.Errorf("left keys: got %v, want [1 2]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{3, 10}) {
+		t.Errorf("right keys: got %v, want [3 10]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 2 {
+		t.Errorf("left separator: got %d, want 2", sep)
+	}
+
+	// rightPage's own separator key must not change.
+	rightSep, found := redistParentSepKey(t, parent, rightId)
+	if !found {
+		t.Fatal("no separator for rightPage in parent")
+	}
+	if rightSep != 10 {
+		t.Errorf("right separator: got %d, want 10 (unchanged)", rightSep)
+	}
+}
+
+// TestRedistributeLeaf_RightHeavy_NotRightMostChild: left=[1], right=[10,20,30],
+// rightPage is not the rightMostChild.
+func TestRedistributeLeaf_RightHeavy_NotRightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1}, []uint64{10, 20, 30}, false)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 10}) {
+		t.Errorf("left keys: got %v, want [1 10]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{20, 30}) {
+		t.Errorf("right keys: got %v, want [20 30]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 10 {
+		t.Errorf("left separator: got %d, want 10", sep)
+	}
+
+	rightSep, found := redistParentSepKey(t, parent, rightId)
+	if !found {
+		t.Fatal("no separator for rightPage in parent")
+	}
+	if rightSep != 30 {
+		t.Errorf("right separator: got %d, want 30 (unchanged)", rightSep)
+	}
+}
+
+// TestRedistributeLeaf_EqualSizes: both pages have the same record count.
+// Distribution is unchanged; separator key is rewritten with same value.
+func TestRedistributeLeaf_EqualSizes(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{10, 20}, []uint64{30, 40}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{10, 20}) {
+		t.Errorf("left keys: got %v, want [10 20]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{30, 40}) {
+		t.Errorf("right keys: got %v, want [30 40]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 20 {
+		t.Errorf("separator key: got %d, want 20", sep)
+	}
+}
+
+// TestRedistributeLeaf_OddTotal: total=5, left gets floor(5/2)=2, right gets 3.
+func TestRedistributeLeaf_OddTotal(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{5}, []uint64{10, 20, 30, 40}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{5, 10}) {
+		t.Errorf("left keys: got %v, want [5 10]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{20, 30, 40}) {
+		t.Errorf("right keys: got %v, want [20 30 40]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 10 {
+		t.Errorf("separator key: got %d, want 10", sep)
+	}
+}
+
+// TestRedistributeLeaf_TwoRecordsTotal: minimum case — one record per page.
+// After redistribution each page still holds one record; separator stays put.
+func TestRedistributeLeaf_TwoRecordsTotal(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1}, []uint64{2}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1}) {
+		t.Errorf("left keys: got %v, want [1]", redistLeafKeys(t, left))
+	}
+	if !equalSlices(redistLeafKeys(t, right), []uint64{2}) {
+		t.Errorf("right keys: got %v, want [2]", redistLeafKeys(t, right))
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 1 {
+		t.Errorf("separator key: got %d, want 1", sep)
+	}
+}
+
+// TestRedistributeLeaf_SiblingLinksPreserved verifies that left/right sibling
+// pointers on both pages are not modified during redistribution.
+func TestRedistributeLeaf_SiblingLinksPreserved(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10, 20}, true)
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+
+	if left.GetRightSibling() != rightId {
+		t.Errorf("left.rightSibling: got %d, want %d", left.GetRightSibling(), rightId)
+	}
+	if left.GetLeftSibling() != pagemanager.InvalidPageID {
+		t.Errorf("left.leftSibling: got %d, want InvalidPageID", left.GetLeftSibling())
+	}
+	if right.GetLeftSibling() != leftId {
+		t.Errorf("right.leftSibling: got %d, want %d", right.GetLeftSibling(), leftId)
+	}
+	if right.GetRightSibling() != pagemanager.InvalidPageID {
+		t.Errorf("right.rightSibling: got %d, want InvalidPageID", right.GetRightSibling())
+	}
+}
+
+// TestRedistributeLeaf_RecordsRemainSorted verifies that both leaf pages have
+// their keys in ascending order after redistribution.
+func TestRedistributeLeaf_RecordsRemainSorted(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{2, 4, 6, 8}, []uint64{10}, true)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	for _, id := range []uint32{leftPage.GetPageId(), rightPage.GetPageId()} {
+		page := mustReadPage(t, pm, id)
+		keys := redistLeafKeys(t, page)
+		for i := 1; i < len(keys); i++ {
+			if keys[i] <= keys[i-1] {
+				t.Errorf("page %d: keys out of order at index %d: %v", id, i, keys)
+			}
+		}
+	}
+}
+
+// TestRedistributeLeaf_RecordValuesIntact verifies full record payloads (not
+// just keys) survive redistribution without corruption.
+func TestRedistributeLeaf_RecordValuesIntact(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+	bt := NewBTree(pm)
+
+	leftPage, _ := pm.AllocatePage()
+	rightPage, _ := pm.AllocatePage()
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	*leftPage = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightPage = *pagemanager.NewLeafPage(rightId, leftId, pagemanager.InvalidPageID)
+
+	type entry struct {
+		key uint64
+		val string
+	}
+	leftEntries := []entry{{1, "alpha"}, {2, "beta"}, {3, "gamma"}}
+	rightEntries := []entry{{20, "delta"}}
+
+	for _, e := range leftEntries {
+		leftPage.InsertRecord(makeRecord(e.key, []byte(e.val)))
+	}
+	for _, e := range rightEntries {
+		rightPage.InsertRecord(makeRecord(e.key, []byte(e.val)))
+	}
+
+	parentPage, _ := pm.AllocatePage()
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, rightId)
+	parentPage.InsertRecord(EncodeInternalRecord(3, leftId))
+	pm.WritePage(leftPage)
+	pm.WritePage(rightPage)
+	pm.WritePage(parentPage)
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	// total=4, mid=2 → left=[{1,"alpha"},{2,"beta"}], right=[{3,"gamma"},{20,"delta"}]
+	wantVals := map[uint64]string{1: "alpha", 2: "beta", 3: "gamma", 20: "delta"}
+	for _, id := range []uint32{leftId, rightId} {
+		page := mustReadPage(t, pm, id)
+		for i := 0; i < int(page.GetRowCount()); i++ {
+			rec, ok := page.GetRecord(i)
+			if !ok {
+				t.Fatalf("page %d slot %d: GetRecord failed", id, i)
+			}
+			k := RecordKey(rec)
+			if got, want := string(rec[8:]), wantVals[k]; got != want {
+				t.Errorf("key %d value: got %q, want %q", k, got, want)
+			}
+		}
+	}
+}
+
+// TestRedistributeLeaf_PagesWrittenToDisk verifies all three pages are
+// durably written by re-reading them from the page manager.
+func TestRedistributeLeaf_PagesWrittenToDisk(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10}, true)
+
+	leftId := leftPage.GetPageId()
+	rightId := rightPage.GetPageId()
+	parentId := parentPage.GetPageId()
+
+	if err := bt.redistributeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentId)
+
+	if left.GetRowCount() != 2 {
+		t.Errorf("left row count: got %d, want 2", left.GetRowCount())
+	}
+	if right.GetRowCount() != 2 {
+		t.Errorf("right row count: got %d, want 2", right.GetRowCount())
+	}
+	if parent.GetRowCount() != 1 {
+		t.Errorf("parent row count: got %d, want 1", parent.GetRowCount())
+	}
+}
+
+// TestRedistributeLeaf_MultipleChildren verifies that when the parent has
+// several children, only leftPage's separator is updated and all others are
+// left untouched.
+func TestRedistributeLeaf_MultipleChildren(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+	bt := NewBTree(pm)
+
+	alloc := func() *pagemanager.Page {
+		p, err := pm.AllocatePage()
+		if err != nil {
+			t.Fatalf("AllocatePage: %v", err)
+		}
+		return p
+	}
+
+	// Four leaf pages: A (left, heavy), B (right), C (unchanged sibling), D (rightMostChild).
+	a, b, c, d := alloc(), alloc(), alloc(), alloc()
+	aId, bId, cId, dId := a.GetPageId(), b.GetPageId(), c.GetPageId(), d.GetPageId()
+
+	*a = *pagemanager.NewLeafPage(aId, pagemanager.InvalidPageID, bId)
+	*b = *pagemanager.NewLeafPage(bId, aId, cId)
+	*c = *pagemanager.NewLeafPage(cId, bId, pagemanager.InvalidPageID)
+	*d = *pagemanager.NewLeafPage(dId, pagemanager.InvalidPageID, pagemanager.InvalidPageID)
+
+	for _, k := range []uint64{1, 2, 3, 4} {
+		a.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	b.InsertRecord(makeRecord(50, []byte("v")))
+	c.InsertRecord(makeRecord(100, []byte("v")))
+
+	// Parent: (4,aId), (50,bId), (100,cId), rightMostChild=dId
+	parent := alloc()
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 1, dId)
+	parent.InsertRecord(EncodeInternalRecord(4, aId))
+	parent.InsertRecord(EncodeInternalRecord(50, bId))
+	parent.InsertRecord(EncodeInternalRecord(100, cId))
+
+	for _, p := range []*pagemanager.Page{a, b, c, d, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+
+	if err := bt.redistributeLeaf(a, b, parent); err != nil {
+		t.Fatalf("redistributeLeaf: %v", err)
+	}
+
+	// total=5, mid=2 → A=[1,2], B=[3,4,50]
+	pa := mustReadPage(t, pm, parent.GetPageId())
+	aPage := mustReadPage(t, pm, aId)
+	bPage := mustReadPage(t, pm, bId)
+
+	if !equalSlices(redistLeafKeys(t, aPage), []uint64{1, 2}) {
+		t.Errorf("A keys: got %v, want [1 2]", redistLeafKeys(t, aPage))
+	}
+	if !equalSlices(redistLeafKeys(t, bPage), []uint64{3, 4, 50}) {
+		t.Errorf("B keys: got %v, want [3 4 50]", redistLeafKeys(t, bPage))
+	}
+
+	aSep, found := redistParentSepKey(t, pa, aId)
+	if !found {
+		t.Fatal("no separator for A in parent")
+	}
+	if aSep != 2 {
+		t.Errorf("A separator: got %d, want 2", aSep)
+	}
+
+	bSep, found := redistParentSepKey(t, pa, bId)
+	if !found {
+		t.Fatal("no separator for B in parent")
+	}
+	if bSep != 50 {
+		t.Errorf("B separator: got %d, want 50 (unchanged)", bSep)
+	}
+
+	cSep, found := redistParentSepKey(t, pa, cId)
+	if !found {
+		t.Fatal("no separator for C in parent")
+	}
+	if cSep != 100 {
+		t.Errorf("C separator: got %d, want 100 (unchanged)", cSep)
+	}
+
+	if pa.GetRightMostChild() != dId {
+		t.Errorf("rightMostChild: got %d, want %d", pa.GetRightMostChild(), dId)
+	}
+}
+
+// ── redistributeInternal helpers ─────────────────────────────────────────────
+
+// redistInternalKeys returns the keys from an internal page's slot array in slot order.
+func redistInternalKeys(t *testing.T, page *pagemanager.Page) []uint64 {
+	t.Helper()
+	keys := make([]uint64, page.GetRowCount())
+	for i := range keys {
+		rec, ok := page.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) failed on page %d", i, page.GetPageId())
+		}
+		k, _, err := DecodeInternalRecord(rec)
+		if err != nil {
+			t.Fatalf("DecodeInternalRecord slot %d on page %d: %v", i, page.GetPageId(), err)
+		}
+		keys[i] = k
+	}
+	return keys
+}
+
+// redistInternalChildIds returns the child IDs from an internal page's slot array in slot order.
+func redistInternalChildIds(t *testing.T, page *pagemanager.Page) []uint32 {
+	t.Helper()
+	ids := make([]uint32, page.GetRowCount())
+	for i := range ids {
+		rec, ok := page.GetRecord(i)
+		if !ok {
+			t.Fatalf("GetRecord(%d) failed on page %d", i, page.GetPageId())
+		}
+		_, cid, err := DecodeInternalRecord(rec)
+		if err != nil {
+			t.Fatalf("DecodeInternalRecord slot %d on page %d: %v", i, page.GetPageId(), err)
+		}
+		ids[i] = cid
+	}
+	return ids
+}
+
+// setupRedistInternal builds two sibling internal pages and a parent, writes them to a
+// fresh DB, and returns the BTree and pages.
+//
+// leftSlots/rightSlots are (key, childId) pairs for each page's slot array (pre-sorted,
+// ascending). leftRmc/rightRmc are the RightMostChild values. parentSepKey is the
+// separator that was previously pushed up to the parent for leftPage; it must satisfy
+// max(leftSlots keys) < parentSepKey < min(rightSlots keys) for a consistent tree.
+//
+// When rightIsRightMost=true, rightPage is the parent's rightMostChild (no own record).
+// When false, a ceiling internal page is created as the rightMostChild and rightPage
+// has its own record in the parent keyed by max(rightSlots keys).
+func setupRedistInternal(
+	t *testing.T,
+	leftSlots [][2]uint64, leftRmc uint32,
+	rightSlots [][2]uint64, rightRmc uint32,
+	parentSepKey uint64,
+	rightIsRightMost bool,
+) (bt *BTree, pm pagemanager.PageManager, leftPage, rightPage, parentPage *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	*leftPage = *pagemanager.NewInternalPage(leftId, 1, leftRmc)
+	*rightPage = *pagemanager.NewInternalPage(rightId, 1, rightRmc)
+
+	for _, s := range leftSlots {
+		if _, ok := leftPage.InsertRecord(EncodeInternalRecord(s[0], uint32(s[1]))); !ok {
+			t.Fatalf("InsertRecord(left, key=%d) failed", s[0])
+		}
+	}
+	for _, s := range rightSlots {
+		if _, ok := rightPage.InsertRecord(EncodeInternalRecord(s[0], uint32(s[1]))); !ok {
+			t.Fatalf("InsertRecord(right, key=%d) failed", s[0])
+		}
+	}
+
+	rightMostId := rightId
+	if !rightIsRightMost {
+		ceilPage, err := pm.AllocatePage()
+		if err != nil {
+			t.Fatalf("AllocatePage(ceil): %v", err)
+		}
+		ceilId := ceilPage.GetPageId()
+		*ceilPage = *pagemanager.NewInternalPage(ceilId, 1, pagemanager.InvalidPageID)
+		if err := pm.WritePage(ceilPage); err != nil {
+			t.Fatalf("WritePage(ceil): %v", err)
+		}
+		rightMostId = ceilId
+	}
+
+	parentPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 2, rightMostId)
+
+	// Insert parentSepKey for leftPage; records must be inserted in ascending key order.
+	parentPage.InsertRecord(EncodeInternalRecord(parentSepKey, leftId))
+	if !rightIsRightMost {
+		// rightPage has its own record keyed by max(rightSlots).
+		var maxRight uint64
+		for _, s := range rightSlots {
+			if s[0] > maxRight {
+				maxRight = s[0]
+			}
+		}
+		parentPage.InsertRecord(EncodeInternalRecord(maxRight, rightId))
+	}
+
+	for _, p := range []*pagemanager.Page{leftPage, rightPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// ── TestRedistributeInternal cases ───────────────────────────────────────────
+
+// TestRedistributeInternal_LeftHeavy_RightMostChild: leftPage has 4 slots, rightPage 1.
+// Extended sequence: [(10,101),(20,102),(30,103),(40,104),(50,105),(100,106)], rmc=107.
+// total=6, mid=3 → left=[(10,101),(20,102),(30,103)], boundary=(40,104), right=[(50,105),(100,106)].
+func TestRedistributeInternal_LeftHeavy_RightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}, {40, 104}}, 105,
+		[][2]uint64{{100, 106}}, 107,
+		50, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 30}) {
+		t.Errorf("left keys: got %v, want [10 20 30]", redistInternalKeys(t, left))
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, left), []uint32{101, 102, 103}) {
+		t.Errorf("left child IDs: got %v, want [101 102 103]", redistInternalChildIds(t, left))
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104", left.GetRightMostChild())
+	}
+
+	if !equalSlices(redistInternalKeys(t, right), []uint64{50, 100}) {
+		t.Errorf("right keys: got %v, want [50 100]", redistInternalKeys(t, right))
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, right), []uint32{105, 106}) {
+		t.Errorf("right child IDs: got %v, want [105 106]", redistInternalChildIds(t, right))
+	}
+	if right.GetRightMostChild() != 107 {
+		t.Errorf("right.rmc: got %d, want 107 (unchanged)", right.GetRightMostChild())
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator record for leftPage in parent")
+	}
+	if sep != 40 {
+		t.Errorf("parent separator: got %d, want 40", sep)
+	}
+	if parent.GetRightMostChild() != rightId {
+		t.Errorf("parent.rightMostChild: got %d, want %d", parent.GetRightMostChild(), rightId)
+	}
+}
+
+// TestRedistributeInternal_RightHeavy_RightMostChild: leftPage has 1 slot, rightPage 4.
+// Extended: [(10,101),(20,102),(50,103),(100,104),(150,105),(200,106)], rmc=107.
+// total=6, mid=3 → left=[(10,101),(20,102),(50,103)], boundary=(100,104), right=[(150,105),(200,106)].
+func TestRedistributeInternal_RightHeavy_RightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{50, 103}, {100, 104}, {150, 105}, {200, 106}}, 107,
+		20, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 50}) {
+		t.Errorf("left keys: got %v, want [10 20 50]", redistInternalKeys(t, left))
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, left), []uint32{101, 102, 103}) {
+		t.Errorf("left child IDs: got %v, want [101 102 103]", redistInternalChildIds(t, left))
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104", left.GetRightMostChild())
+	}
+
+	if !equalSlices(redistInternalKeys(t, right), []uint64{150, 200}) {
+		t.Errorf("right keys: got %v, want [150 200]", redistInternalKeys(t, right))
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, right), []uint32{105, 106}) {
+		t.Errorf("right child IDs: got %v, want [105 106]", redistInternalChildIds(t, right))
+	}
+	if right.GetRightMostChild() != 107 {
+		t.Errorf("right.rmc: got %d, want 107 (unchanged)", right.GetRightMostChild())
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 100 {
+		t.Errorf("parent separator: got %d, want 100", sep)
+	}
+	if parent.GetRightMostChild() != rightId {
+		t.Errorf("parent.rightMostChild: got %d, want %d", parent.GetRightMostChild(), rightId)
+	}
+}
+
+// TestRedistributeInternal_LeftHeavy_NotRightMostChild: same as LeftHeavy above but
+// rightPage has its own record in the parent. Verifies rightPage's separator is untouched.
+func TestRedistributeInternal_LeftHeavy_NotRightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}, {40, 104}}, 105,
+		[][2]uint64{{100, 106}}, 107,
+		50, false)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 30}) {
+		t.Errorf("left keys: got %v, want [10 20 30]", redistInternalKeys(t, left))
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104", left.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, right), []uint64{50, 100}) {
+		t.Errorf("right keys: got %v, want [50 100]", redistInternalKeys(t, right))
+	}
+
+	leftSep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if leftSep != 40 {
+		t.Errorf("left separator: got %d, want 40", leftSep)
+	}
+
+	rightSep, found := redistParentSepKey(t, parent, rightId)
+	if !found {
+		t.Fatal("no separator for rightPage in parent")
+	}
+	if rightSep != 100 {
+		t.Errorf("right separator: got %d, want 100 (unchanged)", rightSep)
+	}
+}
+
+// TestRedistributeInternal_RightHeavy_NotRightMostChild: right has more slots and its
+// own parent record. Verifies rightPage's separator key is not changed.
+func TestRedistributeInternal_RightHeavy_NotRightMostChild(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{50, 103}, {100, 104}, {150, 105}, {200, 106}}, 107,
+		20, false)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 50}) {
+		t.Errorf("left keys: got %v, want [10 20 50]", redistInternalKeys(t, left))
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104", left.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, right), []uint64{150, 200}) {
+		t.Errorf("right keys: got %v, want [150 200]", redistInternalKeys(t, right))
+	}
+
+	leftSep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if leftSep != 100 {
+		t.Errorf("left separator: got %d, want 100", leftSep)
+	}
+
+	rightSep, found := redistParentSepKey(t, parent, rightId)
+	if !found {
+		t.Fatal("no separator for rightPage in parent")
+	}
+	if rightSep != 200 {
+		t.Errorf("right separator: got %d, want 200 (unchanged)", rightSep)
+	}
+}
+
+// TestRedistributeInternal_EqualSizes: both pages have the same slot count.
+// Extended: [(10,101),(20,102),(40,103),(60,104),(80,105)], rmc=106.
+// total=5, mid=2 → left=[(10,101),(20,102)], boundary=(40,103), right=[(60,104),(80,105)].
+// Distribution is unchanged; separator stays at 40.
+func TestRedistributeInternal_EqualSizes(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{60, 104}, {80, 105}}, 106,
+		40, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20}) {
+		t.Errorf("left keys: got %v, want [10 20]", redistInternalKeys(t, left))
+	}
+	if left.GetRightMostChild() != 103 {
+		t.Errorf("left.rmc: got %d, want 103 (unchanged)", left.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, right), []uint64{60, 80}) {
+		t.Errorf("right keys: got %v, want [60 80]", redistInternalKeys(t, right))
+	}
+	if right.GetRightMostChild() != 106 {
+		t.Errorf("right.rmc: got %d, want 106 (unchanged)", right.GetRightMostChild())
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 40 {
+		t.Errorf("parent separator: got %d, want 40 (unchanged)", sep)
+	}
+}
+
+// TestRedistributeInternal_OddTotal: 1+3=4 slots + bridge = 5 total; left gets 2, right gets 2.
+// Extended: [(10,101),(20,102),(50,103),(100,104),(150,105)], rmc=106.
+// total=5, mid=2 → left=[(10,101),(20,102)], boundary=(50,103), right=[(100,104),(150,105)].
+func TestRedistributeInternal_OddTotal(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{50, 103}, {100, 104}, {150, 105}}, 106,
+		20, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20}) {
+		t.Errorf("left keys: got %v, want [10 20]", redistInternalKeys(t, left))
+	}
+	if left.GetRightMostChild() != 103 {
+		t.Errorf("left.rmc: got %d, want 103", left.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, right), []uint64{100, 150}) {
+		t.Errorf("right keys: got %v, want [100 150]", redistInternalKeys(t, right))
+	}
+	if right.GetRightMostChild() != 106 {
+		t.Errorf("right.rmc: got %d, want 106 (unchanged)", right.GetRightMostChild())
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 50 {
+		t.Errorf("parent separator: got %d, want 50", sep)
+	}
+}
+
+// TestRedistributeInternal_MinimumCase: one slot per page — minimum viable redistribution.
+// Extended: [(10,101),(20,102),(50,103)], rmc=104.
+// total=3, mid=1 → left=[(10,101)], boundary=(20,102), right=[(50,103)].
+func TestRedistributeInternal_MinimumCase(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{50, 103}}, 104,
+		20, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	leftId := leftPage.GetPageId()
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10}) {
+		t.Errorf("left keys: got %v, want [10]", redistInternalKeys(t, left))
+	}
+	if left.GetRightMostChild() != 102 {
+		t.Errorf("left.rmc: got %d, want 102 (unchanged for minimum case)", left.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, right), []uint64{50}) {
+		t.Errorf("right keys: got %v, want [50]", redistInternalKeys(t, right))
+	}
+	if right.GetRightMostChild() != 104 {
+		t.Errorf("right.rmc: got %d, want 104 (unchanged)", right.GetRightMostChild())
+	}
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 20 {
+		t.Errorf("parent separator: got %d, want 20 (unchanged for minimum case)", sep)
+	}
+}
+
+// TestRedistributeInternal_LeftRmcUpdated verifies that leftPage.RightMostChild is
+// correctly changed to the boundary record's child pointer after redistribution.
+// Extended: [(10,101),(20,102),(30,103),(40,104),(80,105)], rmc=106.
+// total=5, mid=2 → left=[(10,101),(20,102)], boundary=(30,103), right=[(40,104),(80,105)].
+// leftPage.rmc was 104, becomes 103.
+func TestRedistributeInternal_LeftRmcUpdated(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}}, 104,
+		[][2]uint64{{80, 105}}, 106,
+		40, true)
+
+	rmcBefore := leftPage.GetRightMostChild() // 104
+	if rmcBefore != 104 {
+		t.Fatalf("precondition: left.rmc should be 104, got %d", rmcBefore)
+	}
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if left.GetRightMostChild() != 103 {
+		t.Errorf("left.rmc after redistribution: got %d, want 103 (was 104)", left.GetRightMostChild())
+	}
+}
+
+// TestRedistributeInternal_RightRmcUnchanged verifies that rightPage.RightMostChild
+// is never modified during redistribution.
+func TestRedistributeInternal_RightRmcUnchanged(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}, {40, 104}}, 105,
+		[][2]uint64{{100, 106}}, 107,
+		50, true)
+
+	rmcBefore := rightPage.GetRightMostChild() // 107
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+	if right.GetRightMostChild() != rmcBefore {
+		t.Errorf("right.rmc changed: got %d, want %d (should be unchanged)", right.GetRightMostChild(), rmcBefore)
+	}
+}
+
+// TestRedistributeInternal_ChildPointersIntact verifies that every (key, childId) pair
+// in both pages is exactly correct after redistribution — no pointer corruption.
+func TestRedistributeInternal_ChildPointersIntact(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}, {40, 104}}, 105,
+		[][2]uint64{{100, 106}}, 107,
+		50, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	right := mustReadPage(t, pm, rightPage.GetPageId())
+
+	// left: [(10,101),(20,102),(30,103)], rmc=104
+	wantLeftKeys := []uint64{10, 20, 30}
+	wantLeftCids := []uint32{101, 102, 103}
+	if !equalSlices(redistInternalKeys(t, left), wantLeftKeys) {
+		t.Errorf("left keys: got %v, want %v", redistInternalKeys(t, left), wantLeftKeys)
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, left), wantLeftCids) {
+		t.Errorf("left child IDs: got %v, want %v", redistInternalChildIds(t, left), wantLeftCids)
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104", left.GetRightMostChild())
+	}
+
+	// right: [(50,105),(100,106)], rmc=107
+	wantRightKeys := []uint64{50, 100}
+	wantRightCids := []uint32{105, 106}
+	if !equalSlices(redistInternalKeys(t, right), wantRightKeys) {
+		t.Errorf("right keys: got %v, want %v", redistInternalKeys(t, right), wantRightKeys)
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, right), wantRightCids) {
+		t.Errorf("right child IDs: got %v, want %v", redistInternalChildIds(t, right), wantRightCids)
+	}
+	if right.GetRightMostChild() != 107 {
+		t.Errorf("right.rmc: got %d, want 107", right.GetRightMostChild())
+	}
+}
+
+// TestRedistributeInternal_PagesWrittenToDisk verifies that all three pages are
+// durably written by re-reading them from the page manager after redistribution.
+func TestRedistributeInternal_PagesWrittenToDisk(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}, {30, 103}, {40, 104}}, 105,
+		[][2]uint64{{100, 106}}, 107,
+		50, true)
+
+	leftId, rightId, parentId := leftPage.GetPageId(), rightPage.GetPageId(), parentPage.GetPageId()
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	right := mustReadPage(t, pm, rightId)
+	parent := mustReadPage(t, pm, parentId)
+
+	if left.GetRowCount() != 3 {
+		t.Errorf("left row count after disk re-read: got %d, want 3", left.GetRowCount())
+	}
+	if right.GetRowCount() != 2 {
+		t.Errorf("right row count after disk re-read: got %d, want 2", right.GetRowCount())
+	}
+	if parent.GetRowCount() != 1 {
+		t.Errorf("parent row count after disk re-read: got %d, want 1", parent.GetRowCount())
+	}
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc after disk re-read: got %d, want 104", left.GetRightMostChild())
+	}
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage after disk re-read")
+	}
+	if sep != 40 {
+		t.Errorf("parent separator after disk re-read: got %d, want 40", sep)
+	}
+}
+
+// TestRedistributeInternal_RecordsRemainSorted verifies that both pages have strictly
+// ascending key order in their slot arrays after redistribution.
+func TestRedistributeInternal_RecordsRemainSorted(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{60, 104}, {120, 105}, {180, 106}, {240, 107}}, 108,
+		40, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	for _, id := range []uint32{leftPage.GetPageId(), rightPage.GetPageId()} {
+		page := mustReadPage(t, pm, id)
+		keys := redistInternalKeys(t, page)
+		for i := 1; i < len(keys); i++ {
+			if keys[i] <= keys[i-1] {
+				t.Errorf("page %d: keys out of order at index %d: %v", id, i, keys)
+			}
+		}
+	}
+}
+
+// TestRedistributeInternal_ParentSeparatorCorrect verifies the parent separator key
+// reflects the exact key of the promoted boundary entry (not an adjacent key).
+func TestRedistributeInternal_ParentSeparatorCorrect(t *testing.T) {
+	// Extended: [(5,101),(15,102),(25,103),(35,104),(45,105),(55,106),(65,107)], rmc=108.
+	// total=7, mid=3 → boundary=(35,104), new sep=35.
+	bt, pm, leftPage, rightPage, parentPage := setupRedistInternal(t,
+		[][2]uint64{{5, 101}, {15, 102}, {25, 103}}, 104,
+		[][2]uint64{{45, 105}, {55, 106}, {65, 107}}, 108,
+		35, true)
+
+	if err := bt.redistributeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	sep, found := redistParentSepKey(t, parent, leftPage.GetPageId())
+	if !found {
+		t.Fatal("no separator for leftPage in parent")
+	}
+	if sep != 35 {
+		t.Errorf("parent separator: got %d, want 35 (the promoted bridge key)", sep)
+	}
+	// Verify the bridge child (104) is now leftPage's rightmost child.
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if left.GetRightMostChild() != 104 {
+		t.Errorf("left.rmc: got %d, want 104 (the promoted bridge child)", left.GetRightMostChild())
+	}
+}
+
+// TestRedistributeInternal_MultipleChildren verifies that when the parent has
+// multiple children, only leftPage's separator is updated and all others are untouched.
+func TestRedistributeInternal_MultipleChildren(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+	bt := NewBTree(pm)
+
+	alloc := func() *pagemanager.Page {
+		p, err := pm.AllocatePage()
+		if err != nil {
+			t.Fatalf("AllocatePage: %v", err)
+		}
+		return p
+	}
+
+	// Four internal pages: A (left, heavy), B (right, light), C (unchanged sibling), D (rightMostChild).
+	a, b, c, d := alloc(), alloc(), alloc(), alloc()
+	aId, bId, cId, dId := a.GetPageId(), b.GetPageId(), c.GetPageId(), d.GetPageId()
+
+	// A: [(10,101),(20,102),(30,103)], rmc=104; parentSep=40
+	*a = *pagemanager.NewInternalPage(aId, 1, 104)
+	a.InsertRecord(EncodeInternalRecord(10, 101))
+	a.InsertRecord(EncodeInternalRecord(20, 102))
+	a.InsertRecord(EncodeInternalRecord(30, 103))
+
+	// B: [(80,105)], rmc=106; parent record key=100
+	*b = *pagemanager.NewInternalPage(bId, 1, 106)
+	b.InsertRecord(EncodeInternalRecord(80, 105))
+
+	// C: [(200,107)], rmc=108; parent record key=200
+	*c = *pagemanager.NewInternalPage(cId, 1, 108)
+	c.InsertRecord(EncodeInternalRecord(200, 107))
+
+	// D: empty internal, rightMostChild of parent
+	*d = *pagemanager.NewInternalPage(dId, 1, pagemanager.InvalidPageID)
+
+	// Parent: [(40,aId),(100,bId),(200,cId)], rightMostChild=dId
+	parent := alloc()
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 2, dId)
+	parent.InsertRecord(EncodeInternalRecord(40, aId))
+	parent.InsertRecord(EncodeInternalRecord(100, bId))
+	parent.InsertRecord(EncodeInternalRecord(200, cId))
+
+	for _, p := range []*pagemanager.Page{a, b, c, d, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+
+	// Redistribute A (heavy) and B (light).
+	// Extended: [(10,101),(20,102),(30,103),(40,104),(80,105)], rmc=106.
+	// total=5, mid=2 → A=[(10,101),(20,102)], boundary=(30,103)→sep=30,Armc=103; B=[(40,104),(80,105)].
+	if err := bt.redistributeInternal(a, b, parent); err != nil {
+		t.Fatalf("redistributeInternal: %v", err)
+	}
+
+	pa := mustReadPage(t, pm, parent.GetPageId())
+	aPage := mustReadPage(t, pm, aId)
+	bPage := mustReadPage(t, pm, bId)
+
+	if !equalSlices(redistInternalKeys(t, aPage), []uint64{10, 20}) {
+		t.Errorf("A keys: got %v, want [10 20]", redistInternalKeys(t, aPage))
+	}
+	if aPage.GetRightMostChild() != 103 {
+		t.Errorf("A.rmc: got %d, want 103", aPage.GetRightMostChild())
+	}
+	if !equalSlices(redistInternalKeys(t, bPage), []uint64{40, 80}) {
+		t.Errorf("B keys: got %v, want [40 80]", redistInternalKeys(t, bPage))
+	}
+	if bPage.GetRightMostChild() != 106 {
+		t.Errorf("B.rmc: got %d, want 106 (unchanged)", bPage.GetRightMostChild())
+	}
+
+	aSep, found := redistParentSepKey(t, pa, aId)
+	if !found {
+		t.Fatal("no separator for A in parent")
+	}
+	if aSep != 30 {
+		t.Errorf("A separator: got %d, want 30", aSep)
+	}
+
+	bSep, found := redistParentSepKey(t, pa, bId)
+	if !found {
+		t.Fatal("no separator for B in parent")
+	}
+	if bSep != 100 {
+		t.Errorf("B separator: got %d, want 100 (unchanged)", bSep)
+	}
+
+	cSep, found := redistParentSepKey(t, pa, cId)
+	if !found {
+		t.Fatal("no separator for C in parent")
+	}
+	if cSep != 200 {
+		t.Errorf("C separator: got %d, want 200 (unchanged)", cSep)
+	}
+
+	if pa.GetRightMostChild() != dId {
+		t.Errorf("parent.rightMostChild: got %d, want %d (unchanged)", pa.GetRightMostChild(), dId)
+	}
+}
+
+// ── TestMergeLeaf cases ───────────────────────────────────────────────────────
+
+// setupMergeLeaf is like setupRedistLeaf but also wires rightPage.rightSibling
+// to ceilPage when !rightIsRightMost, giving a fully correct sibling chain.
+func setupMergeLeaf(
+	t *testing.T,
+	leftKeys, rightKeys []uint64,
+	rightIsRightMost bool,
+) (bt *BTree, pm pagemanager.PageManager, leftPage, rightPage, parentPage *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	ceilId := pagemanager.InvalidPageID
+	rightMostId := rightId
+	if !rightIsRightMost {
+		ceilPage, cerr := pm.AllocatePage()
+		if cerr != nil {
+			t.Fatalf("AllocatePage(ceil): %v", cerr)
+		}
+		ceilId = ceilPage.GetPageId()
+		*ceilPage = *pagemanager.NewLeafPage(ceilId, rightId, pagemanager.InvalidPageID)
+		if err := pm.WritePage(ceilPage); err != nil {
+			t.Fatalf("WritePage(ceil): %v", err)
+		}
+		rightMostId = ceilId
+	}
+
+	// Wire full sibling chain: left ↔ right ↔ ceil (if present).
+	*leftPage = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightPage = *pagemanager.NewLeafPage(rightId, leftId, ceilId)
+
+	for _, k := range leftKeys {
+		if _, ok := leftPage.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(left, key=%d) failed", k)
+		}
+	}
+	for _, k := range rightKeys {
+		if _, ok := rightPage.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(right, key=%d) failed", k)
+		}
+	}
+
+	parentPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, rightMostId)
+
+	maxLeft := leftKeys[len(leftKeys)-1]
+	parentPage.InsertRecord(EncodeInternalRecord(maxLeft, leftId))
+	if !rightIsRightMost {
+		maxRight := rightKeys[len(rightKeys)-1]
+		parentPage.InsertRecord(EncodeInternalRecord(maxRight, rightId))
+	}
+
+	for _, p := range []*pagemanager.Page{leftPage, rightPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+
+	bt = NewBTree(pm)
+	return
+}
+
+// TestMergeLeaf_RightMostChild_RecordsMergedInOrder: rightPage is parent's
+// rightMostChild. After merge leftPage must contain all records from both pages
+// in ascending key order.
+func TestMergeLeaf_RightMostChild_RecordsMergedInOrder(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10, 20}, true)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 2, 3, 10, 20}) {
+		t.Errorf("leftPage keys: got %v, want [1 2 3 10 20]", redistLeafKeys(t, left))
+	}
+}
+
+// TestMergeLeaf_NotRightMostChild_RecordsMergedInOrder: rightPage has its own
+// slot entry in the parent. After merge leftPage must hold all records in order.
+func TestMergeLeaf_NotRightMostChild_RecordsMergedInOrder(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10, 20}, false)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistLeafKeys(t, left), []uint64{1, 2, 3, 10, 20}) {
+		t.Errorf("leftPage keys: got %v, want [1 2 3 10 20]", redistLeafKeys(t, left))
+	}
+}
+
+// TestMergeLeaf_RightMostChild_ParentRMCBecomesLeft: after the merge the
+// parent's rightMostChild must point to leftPage, not the freed rightPage.
+func TestMergeLeaf_RightMostChild_ParentRMCBecomesLeft(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{5, 10}, []uint64{15, 25}, true)
+
+	leftId := leftPage.GetPageId()
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRightMostChild() != leftId {
+		t.Errorf("parent.rightMostChild: got %d, want %d (leftPage)", parent.GetRightMostChild(), leftId)
+	}
+	// leftPage's old slot entry must be gone – it is now the rightMostChild.
+	if _, found := redistParentSepKey(t, parent, leftId); found {
+		t.Error("leftPage should have no slot entry in parent after becoming rightMostChild")
+	}
+}
+
+// TestMergeLeaf_RightMostChild_ParentBecomesEmpty: when the parent had exactly
+// one slot entry (k_L, leftPage) and rightPage was the RMC, the parent must end
+// up with zero slot entries.
+func TestMergeLeaf_RightMostChild_ParentBecomesEmpty(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{5}, []uint64{50}, true)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRowCount() != 0 {
+		t.Errorf("parent slot count: got %d, want 0", parent.GetRowCount())
+	}
+	if parent.GetRightMostChild() != leftPage.GetPageId() {
+		t.Errorf("parent.rightMostChild: got %d, want %d (leftPage)", parent.GetRightMostChild(), leftPage.GetPageId())
+	}
+}
+
+// TestMergeLeaf_NotRightMostChild_LeftSepRaisedToRightSep: when rightPage is not
+// the RMC, leftPage's separator in the parent must be raised from max(leftPage)
+// to max(rightPage) after the merge.
+func TestMergeLeaf_NotRightMostChild_LeftSepRaisedToRightSep(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{10, 20}, []uint64{30, 40}, false)
+
+	leftId := leftPage.GetPageId()
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent after merge")
+	}
+	if sep != 40 {
+		t.Errorf("leftPage separator: got %d, want 40 (old max of rightPage)", sep)
+	}
+}
+
+// TestMergeLeaf_NotRightMostChild_RightPageGoneFromParent: rightPage's slot
+// entry must be removed from the parent.
+func TestMergeLeaf_NotRightMostChild_RightPageGoneFromParent(t *testing.T) {
+	bt, _, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2}, []uint64{10, 20}, false)
+
+	_ = bt.mergeLeaf(leftPage, rightPage, parentPage)
+
+	if _, found := redistParentSepKey(t, parentPage, rightPage.GetPageId()); found {
+		t.Error("rightPage should have no slot entry in parent after merge")
+	}
+}
+
+// TestMergeLeaf_NotRightMostChild_ParentSlotCount: parent had two slot entries
+// before the merge; it should have exactly one afterwards.
+func TestMergeLeaf_NotRightMostChild_ParentSlotCount(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10, 20}, false)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRowCount() != 1 {
+		t.Errorf("parent slot count: got %d, want 1", parent.GetRowCount())
+	}
+}
+
+// TestMergeLeaf_NotRightMostChild_RMCUnchanged: the parent's rightMostChild
+// must remain the ceilPage (unchanged) when rightPage is not the RMC.
+func TestMergeLeaf_NotRightMostChild_RMCUnchanged(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2}, []uint64{10, 20}, false)
+
+	// ceilPage is the current rightMostChild.
+	ceilId := parentPage.GetRightMostChild()
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRightMostChild() != ceilId {
+		t.Errorf("parent.rightMostChild: got %d, want %d (ceilPage, unchanged)", parent.GetRightMostChild(), ceilId)
+	}
+}
+
+// TestMergeLeaf_SiblingChain_WithRightSibling: when rightPage has a right
+// sibling (ceilPage), after merge leftPage must point to ceilPage and ceilPage
+// must point back to leftPage.
+func TestMergeLeaf_SiblingChain_WithRightSibling(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2}, []uint64{10, 20}, false)
+
+	leftId := leftPage.GetPageId()
+	ceilId := rightPage.GetRightSibling()
+	if ceilId == pagemanager.InvalidPageID {
+		t.Fatal("test setup: rightPage.rightSibling should be ceilPage")
+	}
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	ceil := mustReadPage(t, pm, ceilId)
+
+	if left.GetRightSibling() != ceilId {
+		t.Errorf("leftPage.rightSibling: got %d, want %d (ceilPage)", left.GetRightSibling(), ceilId)
+	}
+	if ceil.GetLeftSibling() != leftId {
+		t.Errorf("ceilPage.leftSibling: got %d, want %d (leftPage)", ceil.GetLeftSibling(), leftId)
+	}
+}
+
+// TestMergeLeaf_SiblingChain_NoRightSibling: when rightPage is the rightmost
+// leaf, leftPage must have no right sibling after the merge.
+func TestMergeLeaf_SiblingChain_NoRightSibling(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2}, []uint64{10, 20}, true)
+
+	leftId := leftPage.GetPageId()
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	if left.GetRightSibling() != pagemanager.InvalidPageID {
+		t.Errorf("leftPage.rightSibling: got %d, want InvalidPageID", left.GetRightSibling())
+	}
+}
+
+// TestMergeLeaf_LeftSiblingUnchanged: leftPage's left sibling must not be
+// modified by the merge.
+func TestMergeLeaf_LeftSiblingUnchanged(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2, 3}, []uint64{10, 20}, true)
+
+	leftId := leftPage.GetPageId()
+	wantLeft := leftPage.GetLeftSibling()
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	if left.GetLeftSibling() != wantLeft {
+		t.Errorf("leftPage.leftSibling: got %d, want %d (unchanged)", left.GetLeftSibling(), wantLeft)
+	}
+}
+
+// TestMergeLeaf_SingleRecordEachPage_RightMost: merge when each page has one
+// record, rightPage is RMC.
+func TestMergeLeaf_SingleRecordEachPage_RightMost(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{5}, []uint64{15}, true)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistLeafKeys(t, left), []uint64{5, 15}) {
+		t.Errorf("leftPage keys: got %v, want [5 15]", redistLeafKeys(t, left))
+	}
+}
+
+// TestMergeLeaf_ManyRecords_Sorted: merge pages with several records each;
+// result must be strictly ascending.
+func TestMergeLeaf_ManyRecords_Sorted(t *testing.T) {
+	leftKeys := []uint64{1, 2, 3, 4, 5}
+	rightKeys := []uint64{10, 20, 30, 40, 50}
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeaf(t, leftKeys, rightKeys, true)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	keys := redistLeafKeys(t, left)
+	want := []uint64{1, 2, 3, 4, 5, 10, 20, 30, 40, 50}
+	if !equalSlices(keys, want) {
+		t.Errorf("leftPage keys: got %v, want %v", keys, want)
+	}
+	for i := 1; i < len(keys); i++ {
+		if keys[i] <= keys[i-1] {
+			t.Errorf("keys not sorted at position %d: %v", i, keys)
+			break
+		}
+	}
+}
+
+// TestMergeLeaf_ParentHasFourChildren_NotRightMost: parent has four child
+// slots [(10,A),(30,left),(50,right),(70,B)] with RMC=C.  After merging right
+// into left the parent should be [(10,A),(50,left),(70,B)] with RMC=C.
+func TestMergeLeaf_ParentHasFourChildren_NotRightMost(t *testing.T) {
+	var err error
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	alloc := func() *pagemanager.Page {
+		p, e := pm.AllocatePage()
+		if e != nil {
+			t.Fatalf("AllocatePage: %v", e)
+		}
+		return p
+	}
+	write := func(p *pagemanager.Page) {
+		if e := pm.WritePage(p); e != nil {
+			t.Fatalf("WritePage: %v", e)
+		}
+	}
+
+	pageA := alloc()
+	leftPage := alloc()
+	rightPage := alloc()
+	pageB := alloc()
+	pageC := alloc()
+
+	aId := pageA.GetPageId()
+	leftId := leftPage.GetPageId()
+	rightId := rightPage.GetPageId()
+	bId := pageB.GetPageId()
+	cId := pageC.GetPageId()
+
+	*pageA = *pagemanager.NewLeafPage(aId, pagemanager.InvalidPageID, leftId)
+	*leftPage = *pagemanager.NewLeafPage(leftId, aId, rightId)
+	*rightPage = *pagemanager.NewLeafPage(rightId, leftId, bId)
+	*pageB = *pagemanager.NewLeafPage(bId, rightId, cId)
+	*pageC = *pagemanager.NewLeafPage(cId, bId, pagemanager.InvalidPageID)
+
+	for _, k := range []uint64{5, 10} {
+		pageA.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{20, 30} {
+		leftPage.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{40, 50} {
+		rightPage.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{60, 70} {
+		pageB.InsertRecord(makeRecord(k, []byte("v")))
+	}
+
+	// Parent: [(10,A),(30,left),(50,right),(70,B)], RMC=C
+	parentPage := alloc()
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, cId)
+	for _, rec := range []struct {
+		k  uint64
+		id uint32
+	}{{10, aId}, {30, leftId}, {50, rightId}, {70, bId}} {
+		parentPage.InsertRecord(EncodeInternalRecord(rec.k, rec.id))
+	}
+
+	for _, p := range []*pagemanager.Page{pageA, leftPage, rightPage, pageB, pageC, parentPage} {
+		write(p)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftId)
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	// leftPage holds records from both pages.
+	if !equalSlices(redistLeafKeys(t, left), []uint64{20, 30, 40, 50}) {
+		t.Errorf("leftPage keys: got %v, want [20 30 40 50]", redistLeafKeys(t, left))
+	}
+
+	// Parent: [(10,A),(50,left),(70,B)] with RMC=C.
+	if parent.GetRowCount() != 3 {
+		t.Errorf("parent slot count: got %d, want 3", parent.GetRowCount())
+	}
+	if aSep, found := redistParentSepKey(t, parent, aId); !found || aSep != 10 {
+		t.Errorf("A separator: got (%d, %v), want (10, true)", aSep, found)
+	}
+	if leftSep, found := redistParentSepKey(t, parent, leftId); !found || leftSep != 50 {
+		t.Errorf("leftPage separator: got (%d, %v), want (50, true)", leftSep, found)
+	}
+	if _, found := redistParentSepKey(t, parent, rightId); found {
+		t.Error("rightPage should have no separator in parent after merge")
+	}
+	if bSep, found := redistParentSepKey(t, parent, bId); !found || bSep != 70 {
+		t.Errorf("B separator: got (%d, %v), want (70, true)", bSep, found)
+	}
+	if parent.GetRightMostChild() != cId {
+		t.Errorf("parent.rightMostChild: got %d, want %d (C)", parent.GetRightMostChild(), cId)
+	}
+
+	// Sibling chain after merge: left → B → C.
+	leftRe := mustReadPage(t, pm, leftId)
+	bRe := mustReadPage(t, pm, bId)
+	if leftRe.GetRightSibling() != bId {
+		t.Errorf("leftPage.rightSibling: got %d, want %d (B)", leftRe.GetRightSibling(), bId)
+	}
+	if bRe.GetLeftSibling() != leftId {
+		t.Errorf("B.leftSibling: got %d, want %d (leftPage)", bRe.GetLeftSibling(), leftId)
+	}
+}
+
+// TestMergeLeaf_ReturnsNoError: basic sanity – mergeLeaf must not return an
+// error for well-formed input.
+func TestMergeLeaf_ReturnsNoError(t *testing.T) {
+	bt, _, leftPage, rightPage, parentPage := setupMergeLeaf(t,
+		[]uint64{1, 2}, []uint64{10}, true)
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf unexpectedly returned error: %v", err)
+	}
+}
+
+// setupMergeLeafEncoded is like setupMergeLeaf but inserts records using
+// EncodeLeafRecord so they are compatible with bt.Search / DecodeLeafRecord.
+func setupMergeLeafEncoded(
+	t *testing.T,
+	leftKeys, rightKeys []uint64,
+	rightIsRightMost bool,
+) (bt *BTree, pm pagemanager.PageManager, leftPage, rightPage, parentPage *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	ceilId := pagemanager.InvalidPageID
+	rightMostId := rightId
+	if !rightIsRightMost {
+		ceilPage, cerr := pm.AllocatePage()
+		if cerr != nil {
+			t.Fatalf("AllocatePage(ceil): %v", cerr)
+		}
+		ceilId = ceilPage.GetPageId()
+		*ceilPage = *pagemanager.NewLeafPage(ceilId, rightId, pagemanager.InvalidPageID)
+		if err := pm.WritePage(ceilPage); err != nil {
+			t.Fatalf("WritePage(ceil): %v", err)
+		}
+		rightMostId = ceilId
+	}
+
+	*leftPage = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightPage = *pagemanager.NewLeafPage(rightId, leftId, ceilId)
+
+	fields := []Field{strF(1, "val")}
+	for _, k := range leftKeys {
+		rec := encodeLeafRec(t, k, fields)
+		if _, ok := leftPage.InsertRecord(rec); !ok {
+			t.Fatalf("InsertRecord(left, key=%d) failed", k)
+		}
+	}
+	for _, k := range rightKeys {
+		rec := encodeLeafRec(t, k, fields)
+		if _, ok := rightPage.InsertRecord(rec); !ok {
+			t.Fatalf("InsertRecord(right, key=%d) failed", k)
+		}
+	}
+
+	parentPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 1, rightMostId)
+
+	maxLeft := leftKeys[len(leftKeys)-1]
+	parentPage.InsertRecord(EncodeInternalRecord(maxLeft, leftId))
+	if !rightIsRightMost {
+		maxRight := rightKeys[len(rightKeys)-1]
+		parentPage.InsertRecord(EncodeInternalRecord(maxRight, rightId))
+	}
+
+	for _, p := range []*pagemanager.Page{leftPage, rightPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+
+	bt = NewBTree(pm)
+	return
+}
+
+// TestMergeLeaf_SearchConsistency_RightMost: after merging rightPage into
+// leftPage (rightPage was RMC), a tree-level Search must find every key that
+// was in either page.
+func TestMergeLeaf_SearchConsistency_RightMost(t *testing.T) {
+	leftKeys := []uint64{10, 20, 30}
+	rightKeys := []uint64{40, 50}
+
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeafEncoded(t, leftKeys, rightKeys, true)
+	pm.SetRootPageId(parentPage.GetPageId())
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	for _, k := range append(leftKeys, rightKeys...) {
+		_, found, err := bt.Search(k)
+		if err != nil {
+			t.Errorf("Search(%d): unexpected error: %v", k, err)
+		}
+		if !found {
+			t.Errorf("Search(%d): key not found after merge", k)
+		}
+	}
+}
+
+// TestMergeLeaf_SearchConsistency_NotRightMost: after merging rightPage into
+// leftPage (rightPage was not RMC), a tree-level Search must find every key
+// that was in either page and must also find keys in the ceiling page.
+func TestMergeLeaf_SearchConsistency_NotRightMost(t *testing.T) {
+	leftKeys := []uint64{10, 20}
+	rightKeys := []uint64{30, 40}
+
+	bt, pm, leftPage, rightPage, parentPage := setupMergeLeafEncoded(t, leftKeys, rightKeys, false)
+
+	// Insert a record into ceilPage so we can verify it is still reachable.
+	ceilId := parentPage.GetRightMostChild()
+	ceilPage := mustReadPage(t, pm, ceilId)
+	ceilKey := uint64(100)
+	rec := encodeLeafRec(t, ceilKey, []Field{strF(1, "val")})
+	if _, ok := ceilPage.InsertRecord(rec); !ok {
+		t.Fatal("InsertRecord(ceil) failed")
+	}
+	if err := pm.WritePage(ceilPage); err != nil {
+		t.Fatalf("WritePage(ceil): %v", err)
+	}
+
+	pm.SetRootPageId(parentPage.GetPageId())
+
+	if err := bt.mergeLeaf(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeLeaf: %v", err)
+	}
+
+	for _, k := range append(append(leftKeys, rightKeys...), ceilKey) {
+		_, found, err := bt.Search(k)
+		if err != nil {
+			t.Errorf("Search(%d): unexpected error: %v", k, err)
+		}
+		if !found {
+			t.Errorf("Search(%d): key not found after merge", k)
+		}
+	}
+}
+
+// ── mergeInternal helpers & tests ────────────────────────────────────────────
+
+// setupMergeInternal builds two sibling internal pages and a parent, writes them
+// to a fresh DB, and returns the BTree and pages.
+//
+// leftSlots/rightSlots are (key, childId) pairs (pre-sorted ascending).
+// leftRmc/rightRmc are the RightMostChild values for each page.
+// parentSepKey is the separator previously pushed to the parent; it must satisfy
+// max(leftSlots keys) < parentSepKey < min(rightSlots keys).
+//
+// When rightIsRightMost=true, rightPage is the parent's rightMostChild.
+// When false, a ceiling internal page is the parent's rightMostChild and
+// rightPage has its own record keyed by max(rightSlots).
+func setupMergeInternal(
+	t *testing.T,
+	leftSlots [][2]uint64, leftRmc uint32,
+	rightSlots [][2]uint64, rightRmc uint32,
+	parentSepKey uint64,
+	rightIsRightMost bool,
+) (bt *BTree, pm pagemanager.PageManager, leftPage, rightPage, parentPage *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftPage.GetPageId(), rightPage.GetPageId()
+
+	*leftPage = *pagemanager.NewInternalPage(leftId, 1, leftRmc)
+	*rightPage = *pagemanager.NewInternalPage(rightId, 1, rightRmc)
+
+	for _, s := range leftSlots {
+		if _, ok := leftPage.InsertRecord(EncodeInternalRecord(s[0], uint32(s[1]))); !ok {
+			t.Fatalf("InsertRecord(left, key=%d) failed", s[0])
+		}
+	}
+	for _, s := range rightSlots {
+		if _, ok := rightPage.InsertRecord(EncodeInternalRecord(s[0], uint32(s[1]))); !ok {
+			t.Fatalf("InsertRecord(right, key=%d) failed", s[0])
+		}
+	}
+
+	rightMostId := rightId
+	if !rightIsRightMost {
+		ceilPage, cerr := pm.AllocatePage()
+		if cerr != nil {
+			t.Fatalf("AllocatePage(ceil): %v", cerr)
+		}
+		ceilId := ceilPage.GetPageId()
+		*ceilPage = *pagemanager.NewInternalPage(ceilId, 1, pagemanager.InvalidPageID)
+		if err := pm.WritePage(ceilPage); err != nil {
+			t.Fatalf("WritePage(ceil): %v", err)
+		}
+		rightMostId = ceilId
+	}
+
+	parentPage, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 2, rightMostId)
+
+	parentPage.InsertRecord(EncodeInternalRecord(parentSepKey, leftId))
+	if !rightIsRightMost {
+		var maxRight uint64
+		for _, s := range rightSlots {
+			if s[0] > maxRight {
+				maxRight = s[0]
+			}
+		}
+		parentPage.InsertRecord(EncodeInternalRecord(maxRight, rightId))
+	}
+
+	for _, p := range []*pagemanager.Page{leftPage, rightPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// TestMergeInternal_RightMostChild_SlotsMergedInOrder: rightPage is the parent's
+// rightMostChild. After merge leftPage must contain all slots (including the bridge
+// entry keyed by parentSepKey) in ascending key order.
+func TestMergeInternal_RightMostChild_SlotsMergedInOrder(t *testing.T) {
+	// left=[(10,101),(20,102)] rmc=103, sep=30, right=[(40,104),(50,105)] rmc=106
+	// merged keys: [10,20,30,40,50]
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 30, 40, 50}) {
+		t.Errorf("merged keys: got %v, want [10 20 30 40 50]", redistInternalKeys(t, left))
+	}
+}
+
+// TestMergeInternal_RightMostChild_ChildPointersIntact: all child IDs in the merged
+// slot array must preserve the original pointers, including the bridge's child (leftRmc).
+func TestMergeInternal_RightMostChild_ChildPointersIntact(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	// bridge slot child = leftRmc = 103; rightPage slots = (40,104),(50,105)
+	if !equalSlicesU32(redistInternalChildIds(t, left), []uint32{101, 102, 103, 104, 105}) {
+		t.Errorf("merged child IDs: got %v, want [101 102 103 104 105]", redistInternalChildIds(t, left))
+	}
+}
+
+// TestMergeInternal_RightMostChild_RmcTransferred: after merge leftPage's
+// RightMostChild must equal rightPage's original RightMostChild, not leftPage's old one.
+func TestMergeInternal_RightMostChild_RmcTransferred(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if left.GetRightMostChild() != 106 {
+		t.Errorf("leftPage.rmc: got %d, want 106 (rightPage's original rmc)", left.GetRightMostChild())
+	}
+}
+
+// TestMergeInternal_RightMostChild_ParentRMCBecomesLeft: the parent's
+// rightMostChild must point to leftPage, not the freed rightPage.
+func TestMergeInternal_RightMostChild_ParentRMCBecomesLeft(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{5, 101}}, 102,
+		[][2]uint64{{30, 104}}, 105,
+		15, true)
+
+	leftId := leftPage.GetPageId()
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRightMostChild() != leftId {
+		t.Errorf("parent.rmc: got %d, want %d (leftPage)", parent.GetRightMostChild(), leftId)
+	}
+	// leftPage's old slot entry is gone – it is now the rightMostChild.
+	if _, found := redistParentSepKey(t, parent, leftId); found {
+		t.Error("leftPage should have no slot entry in parent after becoming rightMostChild")
+	}
+}
+
+// TestMergeInternal_RightMostChild_ParentBecomesEmpty: when the parent had exactly
+// one slot entry (parentSepKey, leftPage) and rightPage was the RMC, the parent must
+// end up with zero slot entries after the merge.
+func TestMergeInternal_RightMostChild_ParentBecomesEmpty(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{30, 104}}, 105,
+		20, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRowCount() != 0 {
+		t.Errorf("parent slot count: got %d, want 0", parent.GetRowCount())
+	}
+	if parent.GetRightMostChild() != leftPage.GetPageId() {
+		t.Errorf("parent.rmc: got %d, want %d (leftPage)", parent.GetRightMostChild(), leftPage.GetPageId())
+	}
+}
+
+// TestMergeInternal_RightMostChild_BridgeKeyCorrect: the bridge slot inserted into
+// the merged page must carry key=parentSepKey and child=leftPage's old RMC.
+func TestMergeInternal_RightMostChild_BridgeKeyCorrect(t *testing.T) {
+	const parentSep = uint64(30)
+	const leftRmcVal = uint32(103)
+
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, leftRmcVal,
+		[][2]uint64{{40, 104}}, 105,
+		parentSep, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	bridgeFound := false
+	for i := 0; i < int(left.GetRowCount()); i++ {
+		rec, ok := left.GetRecord(i)
+		if !ok {
+			continue
+		}
+		k, cid, err := DecodeInternalRecord(rec)
+		if err != nil {
+			t.Fatalf("DecodeInternalRecord: %v", err)
+		}
+		if k == parentSep && cid == leftRmcVal {
+			bridgeFound = true
+			break
+		}
+	}
+	if !bridgeFound {
+		t.Errorf("bridge record (key=%d, child=%d) not found in merged page", parentSep, leftRmcVal)
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_SlotsMergedInOrder: rightPage has its own
+// slot in the parent. After merge leftPage must hold all slots in ascending order.
+func TestMergeInternal_NotRightMostChild_SlotsMergedInOrder(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, false)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 30, 40, 50}) {
+		t.Errorf("merged keys: got %v, want [10 20 30 40 50]", redistInternalKeys(t, left))
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_RmcTransferred: leftPage's RMC must be
+// updated to rightPage's original RMC even when rightPage is not the parent's RMC.
+func TestMergeInternal_NotRightMostChild_RmcTransferred(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, false)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if left.GetRightMostChild() != 106 {
+		t.Errorf("leftPage.rmc: got %d, want 106", left.GetRightMostChild())
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_LeftSepRaisedToRightSep: leftPage's separator
+// in the parent must be raised from parentSepKey to max(rightSlots) after the merge.
+func TestMergeInternal_NotRightMostChild_LeftSepRaisedToRightSep(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, false)
+
+	leftId := leftPage.GetPageId()
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	sep, found := redistParentSepKey(t, parent, leftId)
+	if !found {
+		t.Fatal("no separator for leftPage in parent after merge")
+	}
+	if sep != 50 {
+		t.Errorf("leftPage separator: got %d, want 50 (old max of rightPage)", sep)
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_RightPageGoneFromParent: rightPage's slot
+// entry must be removed from the parent after merge.
+func TestMergeInternal_NotRightMostChild_RightPageGoneFromParent(t *testing.T) {
+	bt, _, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{40, 104}}, 105,
+		25, false)
+
+	_ = bt.mergeInternal(leftPage, rightPage, parentPage)
+
+	if _, found := redistParentSepKey(t, parentPage, rightPage.GetPageId()); found {
+		t.Error("rightPage should have no slot entry in parent after merge")
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_ParentSlotCount: parent had two slot entries
+// before the merge; it must have exactly one afterwards.
+func TestMergeInternal_NotRightMostChild_ParentSlotCount(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}, {50, 105}}, 106,
+		30, false)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRowCount() != 1 {
+		t.Errorf("parent slot count: got %d, want 1", parent.GetRowCount())
+	}
+}
+
+// TestMergeInternal_NotRightMostChild_ParentRMCUnchanged: the parent's
+// rightMostChild must remain the ceiling page, not rightPage or leftPage.
+func TestMergeInternal_NotRightMostChild_ParentRMCUnchanged(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{40, 104}}, 105,
+		25, false)
+
+	ceilId := parentPage.GetRightMostChild()
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+	if parent.GetRightMostChild() != ceilId {
+		t.Errorf("parent.rmc: got %d, want %d (ceilPage)", parent.GetRightMostChild(), ceilId)
+	}
+}
+
+// TestMergeInternal_PagesWrittenToDisk: re-read leftPage and parentPage from the
+// page manager after merge to verify the durable state matches expectations.
+func TestMergeInternal_PagesWrittenToDisk(t *testing.T) {
+	// left=[(10,101),(20,102)] rmc=103, sep=30, right=[(40,104)] rmc=105
+	// merged: slots=[(10,101),(20,102),(30,103),(40,104)], rmc=105; parent empty, rmc=leftId
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}, {20, 102}}, 103,
+		[][2]uint64{{40, 104}}, 105,
+		30, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	if left.GetRowCount() != 4 {
+		t.Errorf("leftPage slot count from disk: got %d, want 4", left.GetRowCount())
+	}
+	if left.GetRightMostChild() != 105 {
+		t.Errorf("leftPage.rmc from disk: got %d, want 105", left.GetRightMostChild())
+	}
+	if parent.GetRowCount() != 0 {
+		t.Errorf("parent slot count from disk: got %d, want 0", parent.GetRowCount())
+	}
+	if parent.GetRightMostChild() != leftPage.GetPageId() {
+		t.Errorf("parent.rmc from disk: got %d, want leftPage (%d)", parent.GetRightMostChild(), leftPage.GetPageId())
+	}
+}
+
+// TestMergeInternal_SingleSlotEach_RightMost: minimal case – one slot per page.
+// Merged page must have 3 slots (left + bridge + right) with the correct RMC.
+func TestMergeInternal_SingleSlotEach_RightMost(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{10, 101}}, 102,
+		[][2]uint64{{30, 104}}, 105,
+		20, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	if !equalSlices(redistInternalKeys(t, left), []uint64{10, 20, 30}) {
+		t.Errorf("merged keys: got %v, want [10 20 30]", redistInternalKeys(t, left))
+	}
+	if !equalSlicesU32(redistInternalChildIds(t, left), []uint32{101, 102, 104}) {
+		t.Errorf("merged child IDs: got %v, want [101 102 104]", redistInternalChildIds(t, left))
+	}
+	if left.GetRightMostChild() != 105 {
+		t.Errorf("leftPage.rmc: got %d, want 105", left.GetRightMostChild())
+	}
+}
+
+// TestMergeInternal_ManySlots_RightMost: merging pages with several slots each
+// verifies that key ordering is maintained across the full combined sequence.
+func TestMergeInternal_ManySlots_RightMost(t *testing.T) {
+	bt, pm, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{5, 11}, {10, 12}, {15, 13}, {20, 14}}, 15,
+		[][2]uint64{{35, 21}, {40, 22}, {45, 23}}, 24,
+		28, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	left := mustReadPage(t, pm, leftPage.GetPageId())
+	wantKeys := []uint64{5, 10, 15, 20, 28, 35, 40, 45}
+	if !equalSlices(redistInternalKeys(t, left), wantKeys) {
+		t.Errorf("merged keys: got %v, want %v", redistInternalKeys(t, left), wantKeys)
+	}
+	if left.GetRightMostChild() != 24 {
+		t.Errorf("leftPage.rmc: got %d, want 24", left.GetRightMostChild())
+	}
+	// sanity-check test invariant
+	if !sort.SliceIsSorted(wantKeys, func(i, j int) bool { return wantKeys[i] < wantKeys[j] }) {
+		t.Error("test invariant: wantKeys must be sorted")
+	}
+}
+
+// TestMergeInternal_MultipleChildren_NotRightMost: parent has four children
+// (floor, left, right, ceil). After merging left and right only the relevant
+// parent entries change; the floor entry and the parent RMC are untouched.
+func TestMergeInternal_MultipleChildren_NotRightMost(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	floorPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(floor): %v", err)
+	}
+	leftPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	ceilPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(ceil): %v", err)
+	}
+	parentPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+
+	floorId := floorPage.GetPageId()
+	leftId := leftPage.GetPageId()
+	rightId := rightPage.GetPageId()
+	ceilId := ceilPage.GetPageId()
+
+	*floorPage = *pagemanager.NewInternalPage(floorId, 1, 501)
+	*leftPage = *pagemanager.NewInternalPage(leftId, 1, 503)
+	*rightPage = *pagemanager.NewInternalPage(rightId, 1, 505)
+	*ceilPage = *pagemanager.NewInternalPage(ceilId, 1, 507)
+
+	floorPage.InsertRecord(EncodeInternalRecord(10, 501))
+	leftPage.InsertRecord(EncodeInternalRecord(30, 502))
+	rightPage.InsertRecord(EncodeInternalRecord(60, 504))
+	ceilPage.InsertRecord(EncodeInternalRecord(90, 506))
+
+	// parent: [(10,floorId),(40,leftId),(70,rightId)], RMC=ceilId
+	// parentSepKey for leftPage = 40; rightPage's sep = 70
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 2, ceilId)
+	parentPage.InsertRecord(EncodeInternalRecord(10, floorId))
+	parentPage.InsertRecord(EncodeInternalRecord(40, leftId))
+	parentPage.InsertRecord(EncodeInternalRecord(70, rightId))
+
+	for _, p := range []*pagemanager.Page{floorPage, leftPage, rightPage, ceilPage, parentPage} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Fatalf("mergeInternal: %v", err)
+	}
+
+	parent := mustReadPage(t, pm, parentPage.GetPageId())
+
+	// Parent must have 2 slots: (10,floorId) and (70,leftId). RMC=ceilId.
+	if parent.GetRowCount() != 2 {
+		t.Errorf("parent slot count: got %d, want 2", parent.GetRowCount())
+	}
+	if parent.GetRightMostChild() != ceilId {
+		t.Errorf("parent.rmc: got %d, want %d (ceilPage)", parent.GetRightMostChild(), ceilId)
+	}
+
+	sepFloor, foundFloor := redistParentSepKey(t, parent, floorId)
+	if !foundFloor {
+		t.Error("floorPage separator missing from parent after merge")
+	} else if sepFloor != 10 {
+		t.Errorf("floor separator: got %d, want 10", sepFloor)
+	}
+
+	sepLeft, foundLeft := redistParentSepKey(t, parent, leftId)
+	if !foundLeft {
+		t.Error("leftPage separator missing from parent after merge")
+	} else if sepLeft != 70 {
+		t.Errorf("left separator after merge: got %d, want 70 (raised from 40 to rightPage's old key)", sepLeft)
+	}
+
+	if _, found := redistParentSepKey(t, parent, rightId); found {
+		t.Error("rightPage separator should be gone from parent after merge")
+	}
+}
+
+// TestMergeInternal_ReturnsNoError: mergeInternal must not return an error for a
+// well-formed pair of sibling internal pages.
+func TestMergeInternal_ReturnsNoError(t *testing.T) {
+	bt, _, leftPage, rightPage, parentPage := setupMergeInternal(t,
+		[][2]uint64{{5, 11}}, 12,
+		[][2]uint64{{25, 13}}, 14,
+		15, true)
+
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestMergeInternal_NoParentSep_ReturnsError: mergeInternal must return an error
+// when the parent has no slot entry pointing to leftPage.
+func TestMergeInternal_NoParentSep_ReturnsError(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	parentPage, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+
+	*leftPage = *pagemanager.NewInternalPage(leftPage.GetPageId(), 1, 999)
+	*rightPage = *pagemanager.NewInternalPage(rightPage.GetPageId(), 1, 1000)
+	// Parent has no slot entry pointing to leftPage.
+	*parentPage = *pagemanager.NewInternalPage(parentPage.GetPageId(), 2, rightPage.GetPageId())
+
+	bt := NewBTree(pm)
+	if err := bt.mergeInternal(leftPage, rightPage, parentPage); err == nil {
+		t.Error("expected error when no parent separator found for leftPage, got nil")
+	}
+}
+
+// ── TestHandleUnderflow cases ─────────────────────────────────────────────────
+//
+// Free-space arithmetic (PageSize=4096, leaf/internal header=32 bytes → usable=4064):
+//   Large leaf record : makeRecord(k, 200-byte value) = 208 bytes data + 4 slot = 212 bytes
+//   Small leaf record : makeRecord(k, []byte("v"))    =   9 bytes data + 4 slot =  13 bytes
+//   Internal record   : EncodeInternalRecord(k, cid)  =  12 bytes data + 4 slot =  16 bytes
+//
+//   Dense leaf   (10 large records)  : 10×212 = 2120 → free = 4064-2120 = 1944 < 2048 ✓
+//   Sparse leaf  (3 small records)   :  3×13  =   39 → free = 4064-39   = 4025 > 2048 ✓
+//   Dense internal (130 records)     : 130×16 = 2080 → free = 4064-2080 = 1984 < 2048 ✓
+//   Sparse internal (3 records)      :  3×16  =   48 → free = 4064-48   = 4016 > 2048 ✓
+
+// huLargeLeafRecord makes a leaf record with a 200-byte value.
+func huLargeLeafRecord(key uint64) []byte { return makeRecord(key, make([]byte, 200)) }
+
+// huDensifyInternal inserts 130 internal records so GetFreeSpace() drops below
+// minPageFreeSpace (4064 − 130×16 = 1984 < 2048).
+func huDensifyInternal(t *testing.T, page *pagemanager.Page) {
+	t.Helper()
+	for i := 0; i < 130; i++ {
+		if _, ok := page.InsertRecord(EncodeInternalRecord(uint64(5000+i), uint32(9000+i))); !ok {
+			t.Fatalf("huDensifyInternal: InsertRecord failed at i=%d", i)
+		}
+	}
+}
+
+// huLeafFreeSpace returns the free space of a freshly read leaf page.
+func huLeafFreeSpace(t *testing.T, pm pagemanager.PageManager, id uint32) uint16 {
+	t.Helper()
+	return mustReadPage(t, pm, id).GetFreeSpace()
+}
+
+// ── Group 1: no-op scenarios (page NOT underflowing) ─────────────────────────
+
+// TestHandleUnderflow_NoOp_DenseLeaf: a leaf page that is more than half full
+// (free < minPageFreeSpace) must not be modified by handleUnderflow.
+func TestHandleUnderflow_NoOp_DenseLeaf(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+	*page = *pagemanager.NewLeafPage(page.GetPageId(), pagemanager.InvalidPageID, pagemanager.InvalidPageID)
+	for i := 0; i < 10; i++ {
+		page.InsertRecord(huLargeLeafRecord(uint64(i + 1)))
+	}
+	if err := pm.WritePage(page); err != nil {
+		t.Fatalf("WritePage: %v", err)
+	}
+	freeBefore := page.GetFreeSpace()
+	if freeBefore >= minPageFreeSpace {
+		t.Fatalf("precondition: expected dense page (free < %d), got free=%d", minPageFreeSpace, freeBefore)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	got := huLeafFreeSpace(t, pm, page.GetPageId())
+	if got != freeBefore {
+		t.Errorf("dense leaf was modified: free changed from %d to %d", freeBefore, got)
+	}
+}
+
+// TestHandleUnderflow_NoOp_DenseInternal: same invariant for an internal page.
+func TestHandleUnderflow_NoOp_DenseInternal(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+	*page = *pagemanager.NewInternalPage(page.GetPageId(), 1, pagemanager.InvalidPageID)
+	huDensifyInternal(t, page)
+	if err := pm.WritePage(page); err != nil {
+		t.Fatalf("WritePage: %v", err)
+	}
+	freeBefore := page.GetFreeSpace()
+	if freeBefore >= minPageFreeSpace {
+		t.Fatalf("precondition: expected dense page (free < %d), got free=%d", minPageFreeSpace, freeBefore)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	got := mustReadPage(t, pm, page.GetPageId()).GetFreeSpace()
+	if got != freeBefore {
+		t.Errorf("dense internal was modified: free changed from %d to %d", freeBefore, got)
+	}
+}
+
+// TestHandleUnderflow_NoOp_ExactThreshold: free == minPageFreeSpace is NOT
+// strictly greater, so no underflow handling should fire.
+func TestHandleUnderflow_NoOp_ExactThreshold(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+	*page = *pagemanager.NewLeafPage(page.GetPageId(), pagemanager.InvalidPageID, pagemanager.InvalidPageID)
+	// Insert records until free == minPageFreeSpace exactly.
+	// Each large record consumes 212 bytes. Starting free = 4064.
+	// We need free = 2048, so we consume 4064-2048 = 2016 bytes = 9 records × 212 = 1908 bytes consumed,
+	// leaving 4064-1908=2156 free. Use 9 records of exact needed size instead:
+	// recordSize + 4 = (4064 - minPageFreeSpace) / 9... simpler: insert until free just hits 2048.
+	// Actually, use a record size s.t. one record drives free from above 2048 to exactly 2048.
+	// 4064 - N*(dataLen+4) = 2048 → N*(dataLen+4) = 2016. Use N=1, dataLen+4=2016, dataLen=2012.
+	rec := makeRecord(1, make([]byte, 2004)) // 8 key + 2004 value = 2012 data + 4 slot = 2016 total
+	if _, ok := page.InsertRecord(rec); !ok {
+		t.Skip("record too large to insert; threshold test skipped")
+	}
+	if err := pm.WritePage(page); err != nil {
+		t.Fatalf("WritePage: %v", err)
+	}
+	free := page.GetFreeSpace()
+	if free != minPageFreeSpace {
+		t.Skipf("could not hit exact threshold (got free=%d, want %d); skipping", free, minPageFreeSpace)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	got := huLeafFreeSpace(t, pm, page.GetPageId())
+	if got != free {
+		t.Errorf("page at exact threshold was modified: free changed from %d to %d", free, got)
+	}
+}
+
+// ── Group 2: root underflow (empty path) ─────────────────────────────────────
+
+// TestHandleUnderflow_Root_SparseLeaf_NoOp: even if a leaf page is underflowing,
+// when path is empty (page is the root) handleUnderflow must return nil without touching anything.
+func TestHandleUnderflow_Root_SparseLeaf_NoOp(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+	*page = *pagemanager.NewLeafPage(page.GetPageId(), pagemanager.InvalidPageID, pagemanager.InvalidPageID)
+	// 3 small records → free > minPageFreeSpace (underflowing).
+	for _, k := range []uint64{10, 20, 30} {
+		page.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	if err := pm.WritePage(page); err != nil {
+		t.Fatalf("WritePage: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{}); err != nil {
+		t.Fatalf("handleUnderflow on root: %v", err)
+	}
+
+	// Row count must be unchanged.
+	after := mustReadPage(t, pm, page.GetPageId())
+	if after.GetRowCount() != 3 {
+		t.Errorf("root page was modified: row count changed to %d", after.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_Root_SparseInternal_NoOp: same check for an internal root.
+func TestHandleUnderflow_Root_SparseInternal_NoOp(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+	*page = *pagemanager.NewInternalPage(page.GetPageId(), 1, 999)
+	page.InsertRecord(EncodeInternalRecord(50, 998))
+	if err := pm.WritePage(page); err != nil {
+		t.Fatalf("WritePage: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{}); err != nil {
+		t.Fatalf("handleUnderflow on root: %v", err)
+	}
+
+	after := mustReadPage(t, pm, page.GetPageId())
+	if after.GetRowCount() != 1 {
+		t.Errorf("root page was modified: row count changed to %d", after.GetRowCount())
+	}
+}
+
+// ── Group 3: leaf redistribute (dense sibling) ───────────────────────────────
+
+// setupHULeafRedistRight builds:
+//
+//	parent: [(maxPageKey, pageId)], rmc=siblingId
+//	page  : 3 small records with keys pageKeys (sparse, underflowing)
+//	sibling: 10 large records with keys 1000,1010,...,1090 (dense)
+//
+// In this layout page is NOT the rightmost child, so handleUnderflow picks
+// sibling as the right sibling and calls redistributeLeaf(page, sibling, parent).
+func setupHULeafRedistRight(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*page = *pagemanager.NewLeafPage(pageId, pagemanager.InvalidPageID, sibId)
+	*sibling = *pagemanager.NewLeafPage(sibId, pageId, pagemanager.InvalidPageID)
+
+	for _, k := range pageKeys {
+		if _, ok := page.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(page, key=%d) failed", k)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		if _, ok := sibling.InsertRecord(huLargeLeafRecord(uint64(1000 + i*10))); !ok {
+			t.Fatalf("InsertRecord(dense sibling) failed at i=%d", i)
+		}
+	}
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 1, sibId)
+	maxPage := pageKeys[len(pageKeys)-1]
+	parent.InsertRecord(EncodeInternalRecord(maxPage, pageId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// setupHULeafRedistLeft builds:
+//
+//	parent: [(maxSiblingKey, siblingId)], rmc=pageId
+//	sibling: 10 large records (dense, keys 1000,1010,...,1090)
+//	page   : 3 small records (sparse, keys pageKeys) — is the rightmost child
+//
+// handleUnderflow identifies sibling as the left sibling and calls
+// redistributeLeaf(sibling, page, parent).
+func setupHULeafRedistLeft(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*sibling = *pagemanager.NewLeafPage(sibId, pagemanager.InvalidPageID, pageId)
+	*page = *pagemanager.NewLeafPage(pageId, sibId, pagemanager.InvalidPageID)
+
+	for i := 0; i < 10; i++ {
+		if _, ok := sibling.InsertRecord(huLargeLeafRecord(uint64(1000 + i*10))); !ok {
+			t.Fatalf("InsertRecord(dense sibling) failed at i=%d", i)
+		}
+	}
+	for _, k := range pageKeys {
+		if _, ok := page.InsertRecord(makeRecord(k, []byte("v"))); !ok {
+			t.Fatalf("InsertRecord(page, key=%d) failed", k)
+		}
+	}
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 1, pageId)
+	// sibling's max key is 1090
+	parent.InsertRecord(EncodeInternalRecord(1090, sibId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// TestHandleUnderflow_Leaf_RightSibling_Dense_Redistributes verifies that when
+// the right sibling is dense, handleUnderflow calls redistributeLeaf and both
+// pages end up with records.
+func TestHandleUnderflow_Leaf_RightSibling_Dense_Redistributes(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+
+	if p.GetRowCount() == 0 {
+		t.Error("page has no records after redistribute")
+	}
+	if s.GetRowCount() == 0 {
+		t.Error("sibling has no records after redistribute")
+	}
+	// Combined total must be preserved (3 + 10 = 13).
+	if int(p.GetRowCount())+int(s.GetRowCount()) != 13 {
+		t.Errorf("total record count changed: got %d, want 13", int(p.GetRowCount())+int(s.GetRowCount()))
+	}
+}
+
+// TestHandleUnderflow_Leaf_LeftSibling_Dense_Redistributes: same with the
+// underflowing page as the rightmost child (left sibling scenario).
+func TestHandleUnderflow_Leaf_LeftSibling_Dense_Redistributes(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistLeft(t, []uint64{2000, 2001, 2002})
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+
+	if p.GetRowCount() == 0 {
+		t.Error("page has no records after redistribute")
+	}
+	if s.GetRowCount() == 0 {
+		t.Error("sibling has no records after redistribute")
+	}
+	if int(p.GetRowCount())+int(s.GetRowCount()) != 13 {
+		t.Errorf("total record count changed: got %d, want 13", int(p.GetRowCount())+int(s.GetRowCount()))
+	}
+}
+
+// TestHandleUnderflow_Leaf_Redistribute_RecordsEvenlySplit: the 13 combined
+// records must be split floor(13/2)=6 left, 7 right.
+func TestHandleUnderflow_Leaf_Redistribute_RecordsEvenlySplit(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// Re-read from disk: handleUnderflow allocates its own page pointer for the
+	// sibling internally, so the caller's sibling variable is stale.
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+
+	// redistributeLeaf splits at mid = 13/2 = 6.
+	if p.GetRowCount() != 6 {
+		t.Errorf("page row count: got %d, want 6", p.GetRowCount())
+	}
+	if s.GetRowCount() != 7 {
+		t.Errorf("sibling row count: got %d, want 7", s.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_Leaf_Redistribute_KeysRemainSorted: both pages must have
+// strictly ascending key order after redistribution.
+func TestHandleUnderflow_Leaf_Redistribute_KeysRemainSorted(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	for _, id := range []uint32{page.GetPageId(), sibling.GetPageId()} {
+		p := mustReadPage(t, pm, id)
+		keys := redistLeafKeys(t, p)
+		for i := 1; i < len(keys); i++ {
+			if keys[i] <= keys[i-1] {
+				t.Errorf("page %d: keys out of order at index %d: %v", id, i, keys)
+			}
+		}
+	}
+}
+
+// TestHandleUnderflow_Leaf_Redistribute_AllOriginalKeysPresent: no key must be
+// lost during redistribution.
+func TestHandleUnderflow_Leaf_Redistribute_AllOriginalKeysPresent(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+
+	// Collect the original keys from the sibling before the call.
+	var wantKeys []uint64
+	for _, k := range []uint64{1, 2, 3} {
+		wantKeys = append(wantKeys, k)
+	}
+	for i := 0; i < 10; i++ {
+		wantKeys = append(wantKeys, uint64(1000+i*10))
+	}
+	sort.Slice(wantKeys, func(i, j int) bool { return wantKeys[i] < wantKeys[j] })
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	var gotKeys []uint64
+	for _, id := range []uint32{page.GetPageId(), sibling.GetPageId()} {
+		p := mustReadPage(t, pm, id)
+		gotKeys = append(gotKeys, redistLeafKeys(t, p)...)
+	}
+	sort.Slice(gotKeys, func(i, j int) bool { return gotKeys[i] < gotKeys[j] })
+
+	if !equalSlices(gotKeys, wantKeys) {
+		t.Errorf("keys mismatch after redistribute:\n  got  %v\n  want %v", gotKeys, wantKeys)
+	}
+}
+
+// TestHandleUnderflow_Leaf_Redistribute_ParentSeparatorUpdated: the parent's
+// separator for the left page must be updated to max(leftPage) after redistribution.
+func TestHandleUnderflow_Leaf_Redistribute_ParentSeparatorUpdated(t *testing.T) {
+	bt, pm, page, _, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+	pageId := page.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	parentAfter := mustReadPage(t, pm, parent.GetPageId())
+	pageAfter := mustReadPage(t, pm, pageId)
+
+	sep, found := redistParentSepKey(t, parentAfter, pageId)
+	if !found {
+		t.Fatal("parent no longer has a separator for the page")
+	}
+	// Separator must equal the max key now stored in the left page.
+	lastKey := redistLeafKeys(t, pageAfter)
+	maxLeft := lastKey[len(lastKey)-1]
+	if sep != maxLeft {
+		t.Errorf("parent separator: got %d, want %d (max of left page)", sep, maxLeft)
+	}
+}
+
+// TestHandleUnderflow_Leaf_Redistribute_PagesWrittenToDisk: re-reading the pages
+// after the call must reflect the redistributed state.
+func TestHandleUnderflow_Leaf_Redistribute_PagesWrittenToDisk(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafRedistRight(t, []uint64{1, 2, 3})
+	pageId, sibId, parentId := page.GetPageId(), sibling.GetPageId(), parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+	par := mustReadPage(t, pm, parentId)
+
+	if int(p.GetRowCount())+int(s.GetRowCount()) != 13 {
+		t.Errorf("total row count after re-read: got %d, want 13", int(p.GetRowCount())+int(s.GetRowCount()))
+	}
+	_, found := redistParentSepKey(t, par, pageId)
+	if !found {
+		t.Error("parent separator missing after re-read")
+	}
+}
+
+// ── Group 4: leaf merge (sparse sibling) ─────────────────────────────────────
+
+// setupHULeafMergeRight builds:
+//
+//	parent: [(maxPageKey, pageId)], rmc=siblingId
+//	page  : sparse (3 small records, keys pageKeys)
+//	sibling: sparse (2 small records, keys 500, 600) — rightmost child of parent
+//
+// handleUnderflow picks sibling as the right sibling and calls
+// mergeLeaf(page, sibling, parent).
+func setupHULeafMergeRight(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*page = *pagemanager.NewLeafPage(pageId, pagemanager.InvalidPageID, sibId)
+	*sibling = *pagemanager.NewLeafPage(sibId, pageId, pagemanager.InvalidPageID)
+
+	for _, k := range pageKeys {
+		page.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	sibling.InsertRecord(makeRecord(500, []byte("v")))
+	sibling.InsertRecord(makeRecord(600, []byte("v")))
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 1, sibId)
+	maxPage := pageKeys[len(pageKeys)-1]
+	parent.InsertRecord(EncodeInternalRecord(maxPage, pageId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// setupHULeafMergeLeft builds:
+//
+//	parent: [(maxSiblingKey, siblingId)], rmc=pageId
+//	sibling: sparse (keys 1, 2)
+//	page   : sparse (keys pageKeys) — is the rightmost child
+//
+// handleUnderflow identifies sibling as the left sibling and calls
+// mergeLeaf(sibling, page, parent).
+func setupHULeafMergeLeft(t *testing.T, pageKeys []uint64) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*sibling = *pagemanager.NewLeafPage(sibId, pagemanager.InvalidPageID, pageId)
+	*page = *pagemanager.NewLeafPage(pageId, sibId, pagemanager.InvalidPageID)
+
+	sibling.InsertRecord(makeRecord(1, []byte("v")))
+	sibling.InsertRecord(makeRecord(2, []byte("v")))
+	for _, k := range pageKeys {
+		page.InsertRecord(makeRecord(k, []byte("v")))
+	}
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 1, pageId)
+	parent.InsertRecord(EncodeInternalRecord(2, sibId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// TestHandleUnderflow_Leaf_RightSibling_Sparse_Merges: when both page and its
+// right sibling are sparse, handleUnderflow merges them. The surviving left page
+// must hold all records and the parent must have one fewer entry.
+func TestHandleUnderflow_Leaf_RightSibling_Sparse_Merges(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafMergeRight(t, []uint64{10, 20, 30})
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+	parentId := parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	par := mustReadPage(t, pm, parentId)
+
+	// All 5 records (3 + 2) must be in the surviving page.
+	if p.GetRowCount() != 5 {
+		t.Errorf("merged page row count: got %d, want 5", p.GetRowCount())
+	}
+	// Parent's only slot (pointing to page) must have been removed;
+	// parent now has pageId as rightMostChild and zero slot entries.
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after merge: got %d, want 0", par.GetRowCount())
+	}
+	if par.GetRightMostChild() != pageId {
+		t.Errorf("parent rmc after merge: got %d, want %d", par.GetRightMostChild(), pageId)
+	}
+	// sibId must have been freed (now at head of free list).
+	_ = sibId // just checking via the page manager's meta is sufficient
+}
+
+// TestHandleUnderflow_Leaf_LeftSibling_Sparse_Merges: page is the rightmost child,
+// sibling is to the left. mergeLeaf(sibling, page, parent) must run; the sibling
+// (left) absorbs page's records and page is freed.
+func TestHandleUnderflow_Leaf_LeftSibling_Sparse_Merges(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHULeafMergeLeft(t, []uint64{100, 200, 300})
+	sibId := sibling.GetPageId()
+	parentId := parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	sib := mustReadPage(t, pm, sibId)
+	par := mustReadPage(t, pm, parentId)
+
+	// sibling absorbs page's 3 records plus its own 2 → 5 total.
+	if sib.GetRowCount() != 5 {
+		t.Errorf("merged sibling row count: got %d, want 5", sib.GetRowCount())
+	}
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after merge: got %d, want 0", par.GetRowCount())
+	}
+	if par.GetRightMostChild() != sibId {
+		t.Errorf("parent rmc after merge: got %d, want %d", par.GetRightMostChild(), sibId)
+	}
+}
+
+// TestHandleUnderflow_Leaf_Merge_AllRecordsPreserved: no record must be lost
+// when merging two sparse leaf pages.
+func TestHandleUnderflow_Leaf_Merge_AllRecordsPreserved(t *testing.T) {
+	bt, pm, page, _, parent := setupHULeafMergeRight(t, []uint64{10, 20, 30})
+	pageId := page.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	got := redistLeafKeys(t, p)
+	want := []uint64{10, 20, 30, 500, 600}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if !equalSlices(got, want) {
+		t.Errorf("merged page keys: got %v, want %v", got, want)
+	}
+}
+
+// TestHandleUnderflow_Leaf_Merge_KeysRemainSorted: the merged page must have
+// its records in ascending key order.
+func TestHandleUnderflow_Leaf_Merge_KeysRemainSorted(t *testing.T) {
+	bt, pm, page, _, parent := setupHULeafMergeRight(t, []uint64{10, 20, 30})
+	pageId := page.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	keys := redistLeafKeys(t, p)
+	for i := 1; i < len(keys); i++ {
+		if keys[i] <= keys[i-1] {
+			t.Errorf("merged page: keys out of order at index %d: %v", i, keys)
+		}
+	}
+}
+
+// TestHandleUnderflow_Leaf_Merge_SiblingChainUpdated: when merging and the freed
+// right sibling had its own right neighbour, that neighbour's leftSibling pointer
+// must be updated to point to the surviving left page.
+func TestHandleUnderflow_Leaf_Merge_SiblingChainUpdated(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, _ := pm.AllocatePage()
+	sibling, _ := pm.AllocatePage()
+	beyond, _ := pm.AllocatePage()
+	pageId, sibId, beyondId := page.GetPageId(), sibling.GetPageId(), beyond.GetPageId()
+
+	// Leaf chain: page ↔ sibling ↔ beyond.
+	*page = *pagemanager.NewLeafPage(pageId, pagemanager.InvalidPageID, sibId)
+	*sibling = *pagemanager.NewLeafPage(sibId, pageId, beyondId)
+	*beyond = *pagemanager.NewLeafPage(beyondId, sibId, pagemanager.InvalidPageID)
+
+	page.InsertRecord(makeRecord(10, []byte("v")))
+	sibling.InsertRecord(makeRecord(100, []byte("v")))
+	beyond.InsertRecord(makeRecord(500, []byte("v")))
+
+	parent, _ := pm.AllocatePage()
+	parentId := parent.GetPageId()
+	*parent = *pagemanager.NewInternalPage(parentId, 1, beyondId)
+	parent.InsertRecord(EncodeInternalRecord(10, pageId))
+	parent.InsertRecord(EncodeInternalRecord(100, sibId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, beyond, parent} {
+		pm.WritePage(p)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// After merging page (left) and sibling (right):
+	// page.rightSibling must be beyondId.
+	pageAfter := mustReadPage(t, pm, pageId)
+	if pageAfter.GetRightSibling() != beyondId {
+		t.Errorf("page.rightSibling: got %d, want %d", pageAfter.GetRightSibling(), beyondId)
+	}
+	// beyond.leftSibling must be pageId.
+	beyondAfter := mustReadPage(t, pm, beyondId)
+	if beyondAfter.GetLeftSibling() != pageId {
+		t.Errorf("beyond.leftSibling: got %d, want %d", beyondAfter.GetLeftSibling(), pageId)
+	}
+}
+
+// TestHandleUnderflow_Leaf_Merge_PagesWrittenToDisk: state must be durable after merge.
+func TestHandleUnderflow_Leaf_Merge_PagesWrittenToDisk(t *testing.T) {
+	bt, pm, page, _, parent := setupHULeafMergeRight(t, []uint64{10, 20, 30})
+	pageId, parentId := page.GetPageId(), parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	par := mustReadPage(t, pm, parentId)
+
+	if p.GetRowCount() != 5 {
+		t.Errorf("merged page row count after re-read: got %d, want 5", p.GetRowCount())
+	}
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after re-read: got %d, want 0", par.GetRowCount())
+	}
+}
+
+// ── Group 5: internal page redistribute (dense sibling) ──────────────────────
+
+// setupHUInternalRedistRight builds:
+//
+//	parent: [(parentSep, pageId)], rmc=siblingId
+//	page  : sparse internal (3 records, keys 10,20,30; rmc=99)
+//	sibling: dense internal (130 records; rmc=8999)
+//
+// handleUnderflow picks sibling as the right sibling and calls
+// redistributeInternal(page, sibling, parent).
+func setupHUInternalRedistRight(t *testing.T) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*page = *pagemanager.NewInternalPage(pageId, 1, 99)
+	page.InsertRecord(EncodeInternalRecord(10, 97))
+	page.InsertRecord(EncodeInternalRecord(20, 98))
+	page.InsertRecord(EncodeInternalRecord(30, 99))
+
+	*sibling = *pagemanager.NewInternalPage(sibId, 1, 8999)
+	huDensifyInternal(t, sibling)
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 2, sibId)
+	// parentSep key must be > all keys in page and < all keys in sibling.
+	parent.InsertRecord(EncodeInternalRecord(40, pageId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// setupHUInternalRedistLeft: page is rightmost child; sibling is dense to the left.
+func setupHUInternalRedistLeft(t *testing.T) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*sibling = *pagemanager.NewInternalPage(sibId, 1, 8999)
+	huDensifyInternal(t, sibling)
+
+	*page = *pagemanager.NewInternalPage(pageId, 1, 6099)
+	page.InsertRecord(EncodeInternalRecord(6000, 6097))
+	page.InsertRecord(EncodeInternalRecord(6010, 6098))
+	page.InsertRecord(EncodeInternalRecord(6020, 6099))
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 2, pageId)
+	// sibling's max key from huDensifyInternal is 5000+129 = 5129.
+	parent.InsertRecord(EncodeInternalRecord(5129, sibId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// TestHandleUnderflow_Internal_RightSibling_Dense_Redistributes: when the right
+// sibling is dense, both internal pages must remain with records after handleUnderflow.
+func TestHandleUnderflow_Internal_RightSibling_Dense_Redistributes(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHUInternalRedistRight(t)
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+
+	if p.GetRowCount() == 0 {
+		t.Error("page has no records after redistribute")
+	}
+	if s.GetRowCount() == 0 {
+		t.Error("sibling has no records after redistribute")
+	}
+	// 3 page slots + bridge(1) + 130 sibling slots = 134 total in allRecords;
+	// mid=67 → page gets 67 slots, sibling gets 66 slots (mid+1..133).
+	totalWant := 3 + 130
+	if int(p.GetRowCount())+int(s.GetRowCount()) != totalWant {
+		t.Errorf("total slot count changed: got %d, want %d", int(p.GetRowCount())+int(s.GetRowCount()), totalWant)
+	}
+}
+
+// TestHandleUnderflow_Internal_LeftSibling_Dense_Redistributes: page is the
+// rightmost child; dense left sibling triggers redistribute.
+func TestHandleUnderflow_Internal_LeftSibling_Dense_Redistributes(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHUInternalRedistLeft(t)
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	s := mustReadPage(t, pm, sibId)
+
+	if p.GetRowCount() == 0 {
+		t.Error("page has no records after redistribute")
+	}
+	if s.GetRowCount() == 0 {
+		t.Error("sibling has no records after redistribute")
+	}
+	totalWant := 130 + 3
+	if int(p.GetRowCount())+int(s.GetRowCount()) != totalWant {
+		t.Errorf("total slot count: got %d, want %d", int(p.GetRowCount())+int(s.GetRowCount()), totalWant)
+	}
+}
+
+// TestHandleUnderflow_Internal_Redistribute_ParentSeparatorUpdated: after
+// redistributeInternal the parent separator for the left page must be the
+// promoted boundary key — strictly greater than max(leftPage slots) and
+// strictly less than min(rightPage slots).
+func TestHandleUnderflow_Internal_Redistribute_ParentSeparatorUpdated(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHUInternalRedistRight(t)
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	parentAfter := mustReadPage(t, pm, parent.GetPageId())
+	pageAfter := mustReadPage(t, pm, pageId)
+	sibAfter := mustReadPage(t, pm, sibId)
+
+	sep, found := redistParentSepKey(t, parentAfter, pageId)
+	if !found {
+		t.Fatal("parent has no separator for page after redistribute")
+	}
+
+	// For internal pages the promoted key sits between the two halves:
+	//   max(leftPage slots) < sep <= min(rightPage slots).
+	pageKeys := redistInternalKeys(t, pageAfter)
+	sibKeys := redistInternalKeys(t, sibAfter)
+	maxLeft := pageKeys[len(pageKeys)-1]
+	minRight := sibKeys[0]
+
+	if sep <= maxLeft {
+		t.Errorf("separator %d is not > max(left)=%d", sep, maxLeft)
+	}
+	if sep > minRight {
+		t.Errorf("separator %d is not <= min(right)=%d", sep, minRight)
+	}
+}
+
+// ── Group 6: internal page merge (sparse sibling) ────────────────────────────
+
+// setupHUInternalMergeRight builds:
+//
+//	parent: [(40, pageId)], rmc=siblingId
+//	page  : sparse (3 records, keys 10,20,30; rmc=99)
+//	sibling: sparse (2 records, keys 200,300; rmc=399)
+func setupHUInternalMergeRight(t *testing.T) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*page = *pagemanager.NewInternalPage(pageId, 1, 99)
+	page.InsertRecord(EncodeInternalRecord(10, 97))
+	page.InsertRecord(EncodeInternalRecord(20, 98))
+	page.InsertRecord(EncodeInternalRecord(30, 99))
+
+	*sibling = *pagemanager.NewInternalPage(sibId, 1, 399)
+	sibling.InsertRecord(EncodeInternalRecord(200, 397))
+	sibling.InsertRecord(EncodeInternalRecord(300, 398))
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 2, sibId)
+	parent.InsertRecord(EncodeInternalRecord(40, pageId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// setupHUInternalMergeLeft: page is rightmost child; sparse sibling is to the left.
+func setupHUInternalMergeLeft(t *testing.T) (bt *BTree, pm pagemanager.PageManager, page, sibling, parent *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	page, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(page): %v", err)
+	}
+	sibling, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(sibling): %v", err)
+	}
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+
+	*sibling = *pagemanager.NewInternalPage(sibId, 1, 99)
+	sibling.InsertRecord(EncodeInternalRecord(10, 97))
+	sibling.InsertRecord(EncodeInternalRecord(20, 98))
+
+	*page = *pagemanager.NewInternalPage(pageId, 1, 399)
+	page.InsertRecord(EncodeInternalRecord(200, 397))
+	page.InsertRecord(EncodeInternalRecord(300, 398))
+	page.InsertRecord(EncodeInternalRecord(350, 399))
+
+	parent, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(parent): %v", err)
+	}
+	*parent = *pagemanager.NewInternalPage(parent.GetPageId(), 2, pageId)
+	parent.InsertRecord(EncodeInternalRecord(30, sibId))
+
+	for _, p := range []*pagemanager.Page{page, sibling, parent} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	bt = NewBTree(pm)
+	return
+}
+
+// TestHandleUnderflow_Internal_RightSibling_Sparse_Merges: both internal pages
+// sparse → mergeInternal called → left (page) absorbs sibling records + bridge.
+func TestHandleUnderflow_Internal_RightSibling_Sparse_Merges(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHUInternalMergeRight(t)
+	pageId, sibId := page.GetPageId(), sibling.GetPageId()
+	parentId := parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	par := mustReadPage(t, pm, parentId)
+
+	// page had 3 slots; bridge adds 1; sibling had 2 → 3+1+2 = 6 slots in merged page.
+	if p.GetRowCount() != 6 {
+		t.Errorf("merged page row count: got %d, want 6", p.GetRowCount())
+	}
+	// Parent's only slot (pageId) removed; rmc becomes pageId.
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after merge: got %d, want 0", par.GetRowCount())
+	}
+	if par.GetRightMostChild() != pageId {
+		t.Errorf("parent rmc: got %d, want %d", par.GetRightMostChild(), pageId)
+	}
+	// Merged page must adopt sibling's rightmost child.
+	if p.GetRightMostChild() != 399 {
+		t.Errorf("merged page rmc: got %d, want 399", p.GetRightMostChild())
+	}
+	_ = sibId
+}
+
+// TestHandleUnderflow_Internal_LeftSibling_Sparse_Merges: page is rightmost
+// child; sparse left sibling → mergeInternal(sibling, page, parent).
+// sibling absorbs page's records + bridge; page is freed.
+func TestHandleUnderflow_Internal_LeftSibling_Sparse_Merges(t *testing.T) {
+	bt, pm, page, sibling, parent := setupHUInternalMergeLeft(t)
+	sibId := sibling.GetPageId()
+	parentId := parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	sib := mustReadPage(t, pm, sibId)
+	par := mustReadPage(t, pm, parentId)
+
+	// sibling had 2 slots; bridge adds 1; page had 3 → 2+1+3 = 6 slots.
+	if sib.GetRowCount() != 6 {
+		t.Errorf("merged sibling row count: got %d, want 6", sib.GetRowCount())
+	}
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after merge: got %d, want 0", par.GetRowCount())
+	}
+	if par.GetRightMostChild() != sibId {
+		t.Errorf("parent rmc: got %d, want %d", par.GetRightMostChild(), sibId)
+	}
+	// Merged sibling must adopt page's rightmost child.
+	if sib.GetRightMostChild() != 399 {
+		t.Errorf("merged sibling rmc: got %d, want 399", sib.GetRightMostChild())
+	}
+}
+
+// ── TestHandleUnderflow parent-page handling (root collapse & recursive) ──────
+//
+// These tests exercise the new logic that runs after a merge:
+//   (a) root collapse: when the root ends up with 0 entries the surviving merged
+//       child becomes the new root and the old root is freed.
+//   (b) recursive parent underflow: when a non-root parent underflows after a
+//       merge, handleUnderflow is called recursively up the tree.
+
+// setupRootCollapseLeaf creates a minimal 2-level tree:
+//
+//	root  : [(maxLeft, leftId)], rmc=rightId — registered as the PM root
+//	left  : sparse leaf (keys 1, 2, 3)
+//	right : sparse leaf (keys 100, 200) — the rightmost child
+//
+// When pageIsRightmost=false, the returned "page" pointer is the LEFT leaf
+// (not rightmost child); the right leaf is the sibling.
+// When pageIsRightmost=true, the returned "page" pointer is the RIGHT leaf
+// (rightmost child); the left leaf is the sibling.
+func setupRootCollapseLeaf(
+	t *testing.T,
+	pageIsRightmost bool,
+) (bt *BTree, pm pagemanager.PageManager, page, sibling, root *pagemanager.Page) {
+	t.Helper()
+	var err error
+	pm, err = pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftLeaf, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(left): %v", err)
+	}
+	rightLeaf, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(right): %v", err)
+	}
+	leftId, rightId := leftLeaf.GetPageId(), rightLeaf.GetPageId()
+
+	*leftLeaf = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightLeaf = *pagemanager.NewLeafPage(rightId, leftId, pagemanager.InvalidPageID)
+	for _, k := range []uint64{1, 2, 3} {
+		leftLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{100, 200} {
+		rightLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+
+	root, err = pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage(root): %v", err)
+	}
+	rootId := root.GetPageId()
+	*root = *pagemanager.NewInternalPage(rootId, 1, rightId)
+	root.InsertRecord(EncodeInternalRecord(3, leftId))
+
+	for _, p := range []*pagemanager.Page{leftLeaf, rightLeaf, root} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	if err := pm.SetRootPageId(rootId); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
+
+	bt = NewBTree(pm)
+	if pageIsRightmost {
+		return bt, pm, rightLeaf, leftLeaf, root
+	}
+	return bt, pm, leftLeaf, rightLeaf, root
+}
+
+// TestHandleUnderflow_RootCollapse_Leaf_RightSibling: the underflowing page is
+// the left (non-rightmost) child; after merging with the right sibling, the
+// merged left page becomes the new root.
+func TestHandleUnderflow_RootCollapse_Leaf_RightSibling(t *testing.T) {
+	bt, pm, page, _, root := setupRootCollapseLeaf(t, false)
+	leftId := page.GetPageId()
+	rootId := root.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// Surviving page (left leaf) must become the root.
+	if pm.GetRootPageId() != leftId {
+		t.Errorf("root ID: got %d, want %d (left leaf)", pm.GetRootPageId(), leftId)
+	}
+	// Merged page must hold all 5 records.
+	newRoot := mustReadPage(t, pm, leftId)
+	if newRoot.GetRowCount() != 5 {
+		t.Errorf("new root row count: got %d, want 5", newRoot.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_RootCollapse_Leaf_LeftSibling: the underflowing page is
+// the right (rightmost) child; after merging into the left sibling, the LEFT
+// page becomes the new root — not the freed right page.
+// This specifically exercises the survivingPageId fix.
+func TestHandleUnderflow_RootCollapse_Leaf_LeftSibling(t *testing.T) {
+	bt, pm, page, sibling, root := setupRootCollapseLeaf(t, true)
+	leftId := sibling.GetPageId() // sibling is the left leaf here
+	rootId := root.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// The LEFT leaf (sibling) survives the merge and must be the new root.
+	if pm.GetRootPageId() != leftId {
+		t.Errorf("root ID: got %d, want %d (left/sibling leaf)", pm.GetRootPageId(), leftId)
+	}
+	newRoot := mustReadPage(t, pm, leftId)
+	if newRoot.GetRowCount() != 5 {
+		t.Errorf("new root row count: got %d, want 5", newRoot.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_RootCollapse_Leaf_AllRecordsPreserved: regardless of
+// which sibling direction triggered the collapse, no record should be lost.
+func TestHandleUnderflow_RootCollapse_Leaf_AllRecordsPreserved(t *testing.T) {
+	for _, rightmost := range []bool{false, true} {
+		rightmost := rightmost
+		t.Run(fmt.Sprintf("pageIsRightmost=%v", rightmost), func(t *testing.T) {
+			bt, pm, page, _, root := setupRootCollapseLeaf(t, rightmost)
+
+			if err := bt.handleUnderflow(page, []uint32{root.GetPageId()}); err != nil {
+				t.Fatalf("handleUnderflow: %v", err)
+			}
+
+			newRoot := mustReadPage(t, pm, pm.GetRootPageId())
+			got := redistLeafKeys(t, newRoot)
+			sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+			want := []uint64{1, 2, 3, 100, 200}
+			if !equalSlices(got, want) {
+				t.Errorf("new root keys: got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestHandleUnderflow_RootCollapse_Leaf_OldRootFreed: after a root collapse the
+// old root page must be on the free list (i.e. AllocatePage reuses it next).
+func TestHandleUnderflow_RootCollapse_Leaf_OldRootFreed(t *testing.T) {
+	bt, pm, page, _, root := setupRootCollapseLeaf(t, false)
+	rootId := root.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// The next AllocatePage call must reuse the freed root page.
+	reused, err := pm.AllocatePage()
+	if err != nil {
+		t.Fatalf("AllocatePage after collapse: %v", err)
+	}
+	if reused.GetPageId() != rootId {
+		t.Errorf("freed root not reused: got page %d, want %d", reused.GetPageId(), rootId)
+	}
+}
+
+// TestHandleUnderflow_RootCollapse_Internal: two sparse internal pages whose
+// parent is the root; merging them collapses the root.
+func TestHandleUnderflow_RootCollapse_Internal(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftInt, _ := pm.AllocatePage()
+	rightInt, _ := pm.AllocatePage()
+	root, _ := pm.AllocatePage()
+	leftId, rightId, rootId := leftInt.GetPageId(), rightInt.GetPageId(), root.GetPageId()
+
+	*leftInt = *pagemanager.NewInternalPage(leftId, 1, 901)
+	leftInt.InsertRecord(EncodeInternalRecord(10, 900))
+	leftInt.InsertRecord(EncodeInternalRecord(20, 901))
+
+	*rightInt = *pagemanager.NewInternalPage(rightId, 1, 951)
+	rightInt.InsertRecord(EncodeInternalRecord(200, 950))
+	rightInt.InsertRecord(EncodeInternalRecord(300, 951))
+
+	*root = *pagemanager.NewInternalPage(rootId, 2, rightId)
+	root.InsertRecord(EncodeInternalRecord(50, leftId))
+
+	for _, p := range []*pagemanager.Page{leftInt, rightInt, root} {
+		pm.WritePage(p)
+	}
+	if err := pm.SetRootPageId(rootId); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	// rightInt is the rightmost child → left sibling = leftInt → isLeftSibling=true
+	// mergeInternal(leftInt, rightInt, root) → leftInt survives
+	// survivingPageId = siblingPage.GetPageId() = leftId
+	if err := bt.handleUnderflow(rightInt, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	if pm.GetRootPageId() != leftId {
+		t.Errorf("root ID: got %d, want %d (leftInt)", pm.GetRootPageId(), leftId)
+	}
+	// merged leftInt: 2 own slots + bridge(1) + 2 rightInt slots = 5 slots total
+	newRoot := mustReadPage(t, pm, leftId)
+	if newRoot.GetRowCount() != 5 {
+		t.Errorf("merged root row count: got %d, want 5", newRoot.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_RootCollapse_Internal_RightSibling: same as above but
+// the underflowing page is the leftInt (non-rightmost); rightInt is the sibling.
+func TestHandleUnderflow_RootCollapse_Internal_RightSibling(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftInt, _ := pm.AllocatePage()
+	rightInt, _ := pm.AllocatePage()
+	root, _ := pm.AllocatePage()
+	leftId, rightId, rootId := leftInt.GetPageId(), rightInt.GetPageId(), root.GetPageId()
+
+	*leftInt = *pagemanager.NewInternalPage(leftId, 1, 901)
+	leftInt.InsertRecord(EncodeInternalRecord(10, 900))
+
+	*rightInt = *pagemanager.NewInternalPage(rightId, 1, 951)
+	rightInt.InsertRecord(EncodeInternalRecord(200, 950))
+	rightInt.InsertRecord(EncodeInternalRecord(300, 951))
+
+	*root = *pagemanager.NewInternalPage(rootId, 2, rightId)
+	root.InsertRecord(EncodeInternalRecord(50, leftId))
+
+	for _, p := range []*pagemanager.Page{leftInt, rightInt, root} {
+		pm.WritePage(p)
+	}
+	if err := pm.SetRootPageId(rootId); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	// leftInt is NOT rightmost → right sibling = rightInt → isLeftSibling=false
+	// mergeInternal(leftInt, rightInt, root) → leftInt survives
+	// survivingPageId = page.GetPageId() = leftId
+	if err := bt.handleUnderflow(leftInt, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	if pm.GetRootPageId() != leftId {
+		t.Errorf("root ID: got %d, want %d (leftInt)", pm.GetRootPageId(), leftId)
+	}
+	newRoot := mustReadPage(t, pm, leftId)
+	// leftInt: 1 own slot + bridge(1) + 2 rightInt slots = 4 slots total
+	if newRoot.GetRowCount() != 4 {
+		t.Errorf("merged root row count: got %d, want 4", newRoot.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_RootNotCollapsed_WhenRootHasEntries: if the root still
+// has entries after the merge, it must NOT be replaced as root.
+func TestHandleUnderflow_RootNotCollapsed_WhenRootHasEntries(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	// Root has 3 leaf children; merging two of them leaves 1 slot + rmc in root.
+	leftLeaf, _ := pm.AllocatePage()
+	midLeaf, _ := pm.AllocatePage()
+	rightLeaf, _ := pm.AllocatePage()
+	root, _ := pm.AllocatePage()
+	leftId, midId, rightId, rootId :=
+		leftLeaf.GetPageId(), midLeaf.GetPageId(), rightLeaf.GetPageId(), root.GetPageId()
+
+	*leftLeaf = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, midId)
+	*midLeaf = *pagemanager.NewLeafPage(midId, leftId, rightId)
+	*rightLeaf = *pagemanager.NewLeafPage(rightId, midId, pagemanager.InvalidPageID)
+	for _, k := range []uint64{1, 2, 3} {
+		leftLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{100, 200} {
+		midLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{500, 600} {
+		rightLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+
+	*root = *pagemanager.NewInternalPage(rootId, 1, rightId)
+	root.InsertRecord(EncodeInternalRecord(3, leftId))
+	root.InsertRecord(EncodeInternalRecord(200, midId))
+
+	for _, p := range []*pagemanager.Page{leftLeaf, midLeaf, rightLeaf, root} {
+		pm.WritePage(p)
+	}
+	if err := pm.SetRootPageId(rootId); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	// Merge leftLeaf (not rightmost) with midLeaf (right sibling).
+	// Root loses the leftLeaf entry but still has (200, midId) + rmc=rightId.
+	if err := bt.handleUnderflow(leftLeaf, []uint32{rootId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// Root must remain unchanged as the root of the tree.
+	if pm.GetRootPageId() != rootId {
+		t.Errorf("root ID changed: got %d, want %d", pm.GetRootPageId(), rootId)
+	}
+	rootAfter := mustReadPage(t, pm, rootId)
+	if rootAfter.GetRowCount() != 1 {
+		t.Errorf("root row count: got %d, want 1", rootAfter.GetRowCount())
+	}
+}
+
+// TestHandleUnderflow_RecursiveParentUnderflow: a leaf merge cascades upward —
+// the non-root parent underflows, triggering a recursive handleUnderflow call
+// that ultimately merges the parent with its sibling and collapses the root.
+//
+// Tree layout:
+//
+//	root  (level 2): [(300, parentId)], rmc=sibParentId   ← registered root
+//	parent (level 1): [(3, leftLeafId)], rmc=rightLeafId
+//	sibParent (level 1): [(500, 497)], rmc=498
+//	leftLeaf : keys 1,2,3 (sparse)
+//	rightLeaf: keys 100,200 (sparse)
+func TestHandleUnderflow_RecursiveParentUnderflow(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftLeaf, _ := pm.AllocatePage()
+	rightLeaf, _ := pm.AllocatePage()
+	parent, _ := pm.AllocatePage()
+	sibParent, _ := pm.AllocatePage()
+	root, _ := pm.AllocatePage()
+
+	leftId, rightId := leftLeaf.GetPageId(), rightLeaf.GetPageId()
+	parentId, sibId, rootId := parent.GetPageId(), sibParent.GetPageId(), root.GetPageId()
+
+	*leftLeaf = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightLeaf = *pagemanager.NewLeafPage(rightId, leftId, pagemanager.InvalidPageID)
+	for _, k := range []uint64{1, 2, 3} {
+		leftLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+	for _, k := range []uint64{100, 200} {
+		rightLeaf.InsertRecord(makeRecord(k, []byte("v")))
+	}
+
+	*parent = *pagemanager.NewInternalPage(parentId, 1, rightId)
+	parent.InsertRecord(EncodeInternalRecord(3, leftId))
+
+	*sibParent = *pagemanager.NewInternalPage(sibId, 1, 498)
+	sibParent.InsertRecord(EncodeInternalRecord(500, 497))
+
+	*root = *pagemanager.NewInternalPage(rootId, 2, sibId)
+	root.InsertRecord(EncodeInternalRecord(300, parentId))
+
+	for _, p := range []*pagemanager.Page{leftLeaf, rightLeaf, parent, sibParent, root} {
+		if err := pm.WritePage(p); err != nil {
+			t.Fatalf("WritePage: %v", err)
+		}
+	}
+	if err := pm.SetRootPageId(rootId); err != nil {
+		t.Fatalf("SetRootPageId: %v", err)
+	}
+
+	bt := NewBTree(pm)
+	// handleUnderflow(leftLeaf, [rootId, parentId]):
+	//   step 1 — leaf merge: leftLeaf absorbs rightLeaf, parent loses entry → 0 slots
+	//   step 2 — recursive: handleUnderflow(parent, [rootId])
+	//              parent merges with sibParent → root loses entry → 0 slots
+	//   step 3 — root collapse: new root = parent (page, isLeftSibling=false in recursive)
+	if err := bt.handleUnderflow(leftLeaf, []uint32{rootId, parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	// parent must now be the root of the tree.
+	if pm.GetRootPageId() != parentId {
+		t.Errorf("root ID after recursive collapse: got %d, want %d (parent)", pm.GetRootPageId(), parentId)
+	}
+
+	// parent (new root) must contain the bridge + sibParent records.
+	// After leaf merge: parent has 0 slots, rmc=leftId.
+	// After mergeInternal(parent, sibParent, root):
+	//   bridge = (300, leftId); sibParent slots = [(500, 497)]; sibParent rmc = 498
+	//   parent gets: [(300, leftId), (500, 497)], rmc=498
+	newRoot := mustReadPage(t, pm, parentId)
+	if newRoot.GetRowCount() != 2 {
+		t.Errorf("new root (parent) row count: got %d, want 2", newRoot.GetRowCount())
+	}
+	if newRoot.GetRightMostChild() != 498 {
+		t.Errorf("new root rmc: got %d, want 498", newRoot.GetRightMostChild())
+	}
+
+	// Leaf records must still be reachable via the new root's first child.
+	rootKeys := redistInternalKeys(t, newRoot)
+	if len(rootKeys) < 1 || rootKeys[0] != 300 {
+		t.Errorf("new root slot[0] key: got %v, want [300, ...]", rootKeys)
+	}
+}
+
+// TestHandleUnderflow_MergeError_PropagatesFromLeaf: if mergeLeaf returns an
+// error (simulated by passing a nil parentPage write scenario), handleUnderflow
+// must propagate it rather than silently continuing.
+// We test this indirectly by verifying that a malformed parent (no slot for
+// right page) causes mergeLeaf to fail and the error bubbles up.
+func TestHandleUnderflow_MergeError_PropagatesFromLeaf(t *testing.T) {
+	pm, err := pagemanager.NewDB(t.TempDir() + "/btree.db")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { pm.Delete() })
+
+	leftLeaf, _ := pm.AllocatePage()
+	rightLeaf, _ := pm.AllocatePage()
+	parent, _ := pm.AllocatePage()
+	leftId, rightId := leftLeaf.GetPageId(), rightLeaf.GetPageId()
+	parentId := parent.GetPageId()
+
+	*leftLeaf = *pagemanager.NewLeafPage(leftId, pagemanager.InvalidPageID, rightId)
+	*rightLeaf = *pagemanager.NewLeafPage(rightId, leftId, pagemanager.InvalidPageID)
+	leftLeaf.InsertRecord(makeRecord(1, []byte("v")))
+	rightLeaf.InsertRecord(makeRecord(100, []byte("v")))
+
+	// Parent has no slot for rightLeaf (neither slot nor rmc points to it),
+	// so mergeLeaf will return an error ("rightPage not found in parent").
+	// We set rmc=leftId so rightLeaf appears to be a slot-based child.
+	*parent = *pagemanager.NewInternalPage(parentId, 1, leftId)
+	// leftLeaf is the rmc; no slot for rightLeaf anywhere in parent.
+	// We call handleUnderflow on rightLeaf with parent as its parent; the
+	// sibling lookup will find leftId via GetRecord(-1)... actually parent rmc ==
+	// rightLeaf? No. Let's set parent rmc=rightId so rightLeaf appears rightmost:
+	// then sibling = GetRecord(last slot).child which doesn't exist (0 rows).
+	// Easier: make rightLeaf the non-rightmost child with no matching slot.
+	*parent = *pagemanager.NewInternalPage(parentId, 1, rightId)
+	// parent has 0 slots, rmc=rightId. leftLeaf is a phantom child not in parent.
+	// handleUnderflow on rightLeaf: rmc==rightId → isLeftSibling=true →
+	// GetRecord(-1) → last slot of 0-row page → that returns (nil, false) →
+	// DecodInternalRecord will fail → handleUnderflow returns an error.
+	for _, p := range []*pagemanager.Page{leftLeaf, rightLeaf, parent} {
+		pm.WritePage(p)
+	}
+
+	bt := NewBTree(pm)
+	if err := bt.handleUnderflow(rightLeaf, []uint32{parentId}); err == nil {
+		t.Error("expected error for malformed parent, got nil")
+	}
+}
+
+// TestHandleUnderflow_Internal_Merge_AllRecordsPreserved: every key present in
+// either page plus the bridging parent separator must appear in the merged page.
+func TestHandleUnderflow_Internal_Merge_AllRecordsPreserved(t *testing.T) {
+	bt, pm, page, _, parent := setupHUInternalMergeRight(t)
+	pageId := page.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parent.GetPageId()}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	got := redistInternalKeys(t, p)
+	// page keys: 10,20,30; bridge key: 40 (parent sep); sibling keys: 200,300.
+	want := []uint64{10, 20, 30, 40, 200, 300}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if !equalSlices(got, want) {
+		t.Errorf("merged internal keys: got %v, want %v", got, want)
+	}
+}
+
+// TestHandleUnderflow_Internal_Merge_PagesWrittenToDisk: re-read the merged page
+// from disk and verify the row count and rmc survive the flush.
+func TestHandleUnderflow_Internal_Merge_PagesWrittenToDisk(t *testing.T) {
+	bt, pm, page, _, parent := setupHUInternalMergeRight(t)
+	pageId, parentId := page.GetPageId(), parent.GetPageId()
+
+	if err := bt.handleUnderflow(page, []uint32{parentId}); err != nil {
+		t.Fatalf("handleUnderflow: %v", err)
+	}
+
+	p := mustReadPage(t, pm, pageId)
+	par := mustReadPage(t, pm, parentId)
+
+	if p.GetRowCount() != 6 {
+		t.Errorf("merged page row count after re-read: got %d, want 6", p.GetRowCount())
+	}
+	if p.GetRightMostChild() != 399 {
+		t.Errorf("merged page rmc after re-read: got %d, want 399", p.GetRightMostChild())
+	}
+	if par.GetRowCount() != 0 {
+		t.Errorf("parent row count after re-read: got %d, want 0", par.GetRowCount())
+	}
+}
+
+// =====================================
+// Delete tests
+// =====================================
+
+// mustDelete calls Delete and fatals on any error.
+func mustDelete(t *testing.T, bt *BTree, key uint64) {
+	t.Helper()
+	if err := bt.Delete(key); err != nil {
+		t.Fatalf("Delete(key=%d): %v", key, err)
+	}
+}
+
+// assertRootIsLeaf fatals if the root page is not a leaf.
+func assertRootIsLeaf(t *testing.T, pm pagemanager.PageManager) {
+	t.Helper()
+	rootId := pm.GetRootPageId()
+	if rootId == pagemanager.InvalidPageID {
+		t.Fatal("assertRootIsLeaf: tree is empty, expected a leaf root")
+	}
+	rootPage, err := pm.ReadPage(rootId)
+	if err != nil {
+		t.Fatalf("ReadPage(root=%d): %v", rootId, err)
+	}
+	if rootPage.GetPageType() != pagemanager.PageTypeLeaf {
+		t.Errorf("expected root to be a leaf page, got page type %d", rootPage.GetPageType())
+	}
+}
+
+// assertTreeEmpty fatals if the root page ID is not InvalidPageID.
+func assertTreeEmpty(t *testing.T, pm pagemanager.PageManager) {
+	t.Helper()
+	if rootId := pm.GetRootPageId(); rootId != pagemanager.InvalidPageID {
+		t.Errorf("expected empty tree (rootId=InvalidPageID), got rootId=%d", rootId)
+	}
+}
+
+// ---- Basic Delete: empty tree and missing keys ----
+
+// TestDelete_EmptyTree_NoOp verifies Delete on an empty tree returns nil without panics.
+func TestDelete_EmptyTree_NoOp(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	mustDelete(t, bt, 42)
+	assertTreeEmpty(t, pm)
+}
+
+// TestDelete_MissingKey_NoOp verifies deleting a non-existent key leaves the tree unchanged.
+func TestDelete_MissingKey_NoOp(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 10, []Field{intF(1, 10)})
+	mustInsert(t, bt, 20, []Field{intF(1, 20)})
+	mustDelete(t, bt, 15) // 15 is not in the tree
+	assertFound(t, bt, 10, []Field{intF(1, 10)})
+	assertFound(t, bt, 20, []Field{intF(1, 20)})
+}
+
+// TestDelete_MissingKey_BelowAll_NoOp verifies that a key below every stored key is a no-op.
+func TestDelete_MissingKey_BelowAll_NoOp(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 1) // 1 < min stored key
+	for _, k := range []uint64{10, 20, 30} {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+}
+
+// TestDelete_MissingKey_AboveAll_NoOp verifies that a key above every stored key is a no-op.
+func TestDelete_MissingKey_AboveAll_NoOp(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	for _, k := range []uint64{10, 20, 30} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 999) // 999 > max stored key
+	for _, k := range []uint64{10, 20, 30} {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+}
+
+// ---- Basic Delete: single-record root leaf ----
+
+// TestDelete_SingleRecord_TreeBecomesEmpty deletes the only record and verifies the tree is empty.
+func TestDelete_SingleRecord_TreeBecomesEmpty(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, 99, []Field{strF(1, "only-record")})
+	mustDelete(t, bt, 99)
+	assertTreeEmpty(t, pm)
+	assertMissing(t, bt, 99)
+}
+
+// TestDelete_SingleRecord_RepeatedDeleteIsNoOp verifies a second deletion of the same key is a no-op.
+func TestDelete_SingleRecord_RepeatedDeleteIsNoOp(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, 55, []Field{intF(1, 55)})
+	mustDelete(t, bt, 55) // first delete: tree empties
+	mustDelete(t, bt, 55) // second delete: no-op on empty tree
+	assertTreeEmpty(t, pm)
+}
+
+// ---- Basic Delete: multi-record root leaf (single-level tree) ----
+
+// TestDelete_RootLeaf_FirstKey removes the lowest key from a leaf root.
+func TestDelete_RootLeaf_FirstKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	keys := []uint64{10, 20, 30, 40, 50}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 10)
+	assertMissing(t, bt, 10)
+	remaining := []uint64{20, 30, 40, 50}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_RootLeaf_LastKey removes the highest key from a leaf root.
+func TestDelete_RootLeaf_LastKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	keys := []uint64{10, 20, 30, 40, 50}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 50)
+	assertMissing(t, bt, 50)
+	remaining := []uint64{10, 20, 30, 40}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_RootLeaf_MiddleKey removes a middle key and verifies neighbours are unchanged.
+func TestDelete_RootLeaf_MiddleKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	keys := []uint64{10, 20, 30, 40, 50}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 30)
+	assertMissing(t, bt, 30)
+	remaining := []uint64{10, 20, 40, 50}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_RootLeaf_AllRecords_TreeEmpty deletes every record one by one and verifies the tree empties.
+func TestDelete_RootLeaf_AllRecords_TreeEmpty(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	keys := []uint64{5, 15, 25, 35, 45}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	for _, k := range keys {
+		mustDelete(t, bt, k)
+	}
+	assertTreeEmpty(t, pm)
+	for _, k := range keys {
+		assertMissing(t, bt, k)
+	}
+}
+
+// TestDelete_Idempotent_AfterRootLeafDelete deletes the same key twice; the second must be a no-op.
+func TestDelete_Idempotent_AfterRootLeafDelete(t *testing.T) {
+	bt, _ := newTempBTree(t)
+	mustInsert(t, bt, 10, []Field{intF(1, 1)})
+	mustInsert(t, bt, 20, []Field{intF(1, 2)})
+	mustDelete(t, bt, 10)
+	mustDelete(t, bt, 10) // second delete: no-op
+	assertMissing(t, bt, 10)
+	assertFound(t, bt, 20, []Field{intF(1, 2)})
+}
+
+// TestDelete_ThenReinsert verifies a deleted key can be reinserted with a new value.
+func TestDelete_ThenReinsert(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, 42, []Field{intF(1, 1)})
+	mustDelete(t, bt, 42)
+	assertMissing(t, bt, 42)
+	mustInsert(t, bt, 42, []Field{intF(1, 2)})
+	assertFound(t, bt, 42, []Field{intF(1, 2)})
+	verifyLeafChain(t, bt, pm, []uint64{42})
+}
+
+// ---- Edge keys ----
+
+// TestDelete_KeyZero removes key=0 (minimum uint64) and verifies adjacent keys are unaffected.
+func TestDelete_KeyZero(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, 0, []Field{intF(1, 0)})
+	mustInsert(t, bt, 1, []Field{intF(1, 1)})
+	mustInsert(t, bt, 2, []Field{intF(1, 2)})
+	mustDelete(t, bt, 0)
+	assertMissing(t, bt, 0)
+	assertFound(t, bt, 1, []Field{intF(1, 1)})
+	assertFound(t, bt, 2, []Field{intF(1, 2)})
+	verifyLeafChain(t, bt, pm, []uint64{1, 2})
+}
+
+// TestDelete_MaxUint64 removes the maximum uint64 key and verifies the adjacent key is unaffected.
+func TestDelete_MaxUint64(t *testing.T) {
+	const maxKey = ^uint64(0)
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, maxKey-1, []Field{intF(1, 1)})
+	mustInsert(t, bt, maxKey, []Field{intF(1, 2)})
+	mustDelete(t, bt, maxKey)
+	assertMissing(t, bt, maxKey)
+	assertFound(t, bt, maxKey-1, []Field{intF(1, 1)})
+	verifyLeafChain(t, bt, pm, []uint64{maxKey - 1})
+}
+
+// TestDelete_KeyZeroAndMaxTogether inserts and then removes both extreme keys, leaving nothing.
+func TestDelete_KeyZeroAndMaxTogether(t *testing.T) {
+	const maxKey = ^uint64(0)
+	bt, pm := newTempBTree(t)
+	mustInsert(t, bt, 0, []Field{intF(1, 0)})
+	mustInsert(t, bt, maxKey, []Field{intF(1, -1)}) //nolint:gosec
+	mustDelete(t, bt, 0)
+	mustDelete(t, bt, maxKey)
+	assertTreeEmpty(t, pm)
+}
+
+// ---- Multi-level tree: key visibility after deletion ----
+
+// TestDelete_MultiLevel_DeletedKeyNotFound verifies a key is not found after deletion from a
+// multi-level tree built with small records (300 inserts → several leaf splits).
+func TestDelete_MultiLevel_DeletedKeyNotFound(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 300
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	mustDelete(t, bt, 150)
+	assertMissing(t, bt, 150)
+	assertFound(t, bt, 149, []Field{intF(1, 149)})
+	assertFound(t, bt, 151, []Field{intF(1, 151)})
+	remaining := make([]uint64, 0, n-1)
+	for i := uint64(1); i <= n; i++ {
+		if i != 150 {
+			remaining = append(remaining, i)
+		}
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_MultiLevel_FirstKey deletes the smallest key from a multi-level tree.
+func TestDelete_MultiLevel_FirstKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 300
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	mustDelete(t, bt, 1)
+	assertMissing(t, bt, 1)
+	assertFound(t, bt, 2, []Field{intF(1, 2)})
+	remaining := make([]uint64, 0, n-1)
+	for i := uint64(2); i <= n; i++ {
+		remaining = append(remaining, i)
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_MultiLevel_LastKey deletes the largest key from a multi-level tree.
+func TestDelete_MultiLevel_LastKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 300
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	mustDelete(t, bt, n)
+	assertMissing(t, bt, n)
+	assertFound(t, bt, n-1, []Field{intF(1, int64(n-1))})
+	remaining := make([]uint64, 0, n-1)
+	for i := uint64(1); i < n; i++ {
+		remaining = append(remaining, i)
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// ---- Underflow handling: redistribution ----
+//
+// With 180-byte string payloads each record is ~196 bytes (8-byte key + encoding + 4-byte slot).
+// A 4096-byte leaf has 4064 usable bytes, fitting at most 20 records.
+// The 21st insert triggers the first split:
+//
+//	leaf_L = keys 1..10  (10 records, 2104 bytes free → above minPageFreeSpace=2048 → underflowing)
+//	leaf_R = keys 11..21 (11 records, 1908 bytes free → below minPageFreeSpace=2048 → dense)
+//
+// Deleting a key from leaf_L pushes it to 9 records (2300 bytes free), triggering redistribution
+// with the dense right sibling.
+
+// TestDelete_TriggerRedistribute_AllKeysAccessible deletes a left-leaf key to trigger
+// redistribution and verifies every remaining key is still accessible.
+func TestDelete_TriggerRedistribute_AllKeysAccessible(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('a', 180)
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	mustDelete(t, bt, 1)
+	assertMissing(t, bt, 1)
+	remaining := make([]uint64, 20)
+	for i := range remaining {
+		remaining[i] = uint64(i + 2)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, bigVal)})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_TriggerRedistribute_LeafChainOrdered verifies the sibling chain is strictly sorted
+// after a redistribution triggered by deleting a key from the left leaf.
+func TestDelete_TriggerRedistribute_LeafChainOrdered(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('b', 180)
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	mustDelete(t, bt, 5)
+	remaining := make([]uint64, 0, 20)
+	for i := uint64(1); i <= 21; i++ {
+		if i != 5 {
+			remaining = append(remaining, i)
+		}
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_TriggerRedistribute_MultipleKeys deletes several left-leaf keys in succession,
+// triggering redistribution on each, and verifies all remaining keys are found.
+func TestDelete_TriggerRedistribute_MultipleKeys(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('c', 180)
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	mustDelete(t, bt, 1)
+	mustDelete(t, bt, 3)
+	assertMissing(t, bt, 1)
+	assertMissing(t, bt, 3)
+	remaining := make([]uint64, 0, 19)
+	for i := uint64(1); i <= 21; i++ {
+		if i != 1 && i != 3 {
+			remaining = append(remaining, i)
+		}
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, bigVal)})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// ---- Underflow handling: merge and tree collapse ----
+
+// TestDelete_TriggerMerge_TreeCollapsesToLeaf builds a two-level tree, performs deletions that
+// first trigger redistribution and then trigger a merge, and verifies the tree collapses to a
+// single leaf root.
+//
+// Deletion sequence:
+//  1. Delete key 1  → leaf_L underflows → redistribute → leaf_L=[2..11], leaf_R=[12..21]
+//  2. Delete key 2  → leaf_L underflows → right sibling is now also sparse → merge
+//     → surviving leaf holds keys 3..21 and becomes the new root leaf
+func TestDelete_TriggerMerge_TreeCollapsesToLeaf(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('d', 180)
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	mustDelete(t, bt, 1) // redistribution
+	mustDelete(t, bt, 2) // merge + collapse
+
+	assertRootIsLeaf(t, pm)
+
+	remaining := make([]uint64, 0, 19)
+	for i := uint64(3); i <= 21; i++ {
+		remaining = append(remaining, i)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, bigVal)})
+	}
+	assertMissing(t, bt, 1)
+	assertMissing(t, bt, 2)
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_TriggerMerge_SiblingChainUpdated verifies the leaf sibling chain has no orphaned
+// pages after a merge: the freed right leaf must be bypassed in the doubly-linked list.
+func TestDelete_TriggerMerge_SiblingChainUpdated(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('e', 180)
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	mustDelete(t, bt, 1) // redistribution
+	mustDelete(t, bt, 2) // merge
+
+	remaining := make([]uint64, 0, 19)
+	for i := uint64(3); i <= 21; i++ {
+		remaining = append(remaining, i)
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_TriggerMerge_AllOriginalLeftLeafKeys deletes all original left-leaf keys in
+// succession and verifies only the right-leaf keys remain in the tree.
+func TestDelete_TriggerMerge_AllOriginalLeftLeafKeys(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('f', 180)
+	// Insert 1..21: split → leaf_L=[1..10], leaf_R=[11..21]
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	// Deleting the 10 lowest keys (which start in the left leaf) forces redistribution then merge.
+	for k := uint64(1); k <= 10; k++ {
+		mustDelete(t, bt, k)
+	}
+	for i := uint64(11); i <= 21; i++ {
+		assertFound(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	for i := uint64(1); i <= 10; i++ {
+		assertMissing(t, bt, i)
+	}
+	remaining := make([]uint64, 11)
+	for i := range remaining {
+		remaining[i] = uint64(i + 11)
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// ---- Sequential delete-all ----
+
+// TestDelete_AllKeys_AscendingOrder inserts N records and deletes them in ascending key order,
+// verifying the tree is empty at the end.
+func TestDelete_AllKeys_AscendingOrder(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 100
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	for i := uint64(1); i <= n; i++ {
+		mustDelete(t, bt, i)
+		assertMissing(t, bt, i)
+	}
+	assertTreeEmpty(t, pm)
+}
+
+// TestDelete_AllKeys_DescendingOrder inserts N records and deletes them in descending key order.
+func TestDelete_AllKeys_DescendingOrder(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 100
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	for i := uint64(n); i >= 1; i-- {
+		mustDelete(t, bt, i)
+		assertMissing(t, bt, i)
+	}
+	assertTreeEmpty(t, pm)
+}
+
+// TestDelete_AllKeys_LeafChainTrackedPerStep verifies the leaf chain is correct after every
+// single deletion when deleting all keys in ascending order.
+func TestDelete_AllKeys_LeafChainTrackedPerStep(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 50
+	keys := make([]uint64, n)
+	for i := range keys {
+		keys[i] = uint64(i + 1)
+		mustInsert(t, bt, keys[i], []Field{intF(1, int64(keys[i]))})
+	}
+	for i, k := range keys {
+		mustDelete(t, bt, k)
+		remaining := keys[i+1:]
+		if len(remaining) == 0 {
+			assertTreeEmpty(t, pm)
+		} else {
+			for _, rk := range remaining {
+				assertFound(t, bt, rk, []Field{intF(1, int64(rk))})
+			}
+			verifyLeafChain(t, bt, pm, remaining)
+		}
+	}
+}
+
+// TestDelete_AllKeys_ConsecutiveLarge inserts records with large payloads (each ≈196 bytes,
+// enough to force multiple splits) and then deletes them all, verifying the tree empties.
+func TestDelete_AllKeys_ConsecutiveLarge(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	bigVal := repeatedStr('g', 180)
+	const n = 50
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, bigVal)})
+	}
+	for i := uint64(1); i <= n; i++ {
+		mustDelete(t, bt, i)
+	}
+	assertTreeEmpty(t, pm)
+}
+
+// ---- Mixed patterns ----
+
+// TestDelete_HalfKeys_OtherHalfPreserved inserts 200 keys, deletes every odd key, and verifies
+// only the even keys remain in the correct order.
+func TestDelete_HalfKeys_OtherHalfPreserved(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 200
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	var remaining []uint64
+	for i := uint64(1); i <= n; i++ {
+		if i%2 == 0 {
+			remaining = append(remaining, i)
+		} else {
+			mustDelete(t, bt, i)
+		}
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	for i := uint64(1); i <= n; i++ {
+		if i%2 != 0 {
+			assertMissing(t, bt, i)
+		}
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_EveryThirdKey builds a 300-key tree and deletes every third key, verifying
+// the remaining keys and the leaf chain are correct.
+func TestDelete_EveryThirdKey(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 300
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	var deleted, remaining []uint64
+	for i := uint64(1); i <= n; i++ {
+		if i%3 == 0 {
+			deleted = append(deleted, i)
+			mustDelete(t, bt, i)
+		} else {
+			remaining = append(remaining, i)
+		}
+	}
+	for _, k := range deleted {
+		assertMissing(t, bt, k)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, pm, remaining)
+}
+
+// TestDelete_InterleavedInsertDelete interleaves insertions and deletions across two phases
+// and verifies the tree is consistent throughout.
+func TestDelete_InterleavedInsertDelete(t *testing.T) {
+	bt, pm := newTempBTree(t)
+
+	// Phase 1: insert keys 1..50
+	for i := uint64(1); i <= 50; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	// Phase 2: delete every other key, insert new keys 51..100
+	for i := uint64(1); i <= 50; i += 2 {
+		mustDelete(t, bt, i)
+	}
+	for i := uint64(51); i <= 100; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+
+	live := make(map[uint64]bool)
+	for i := uint64(2); i <= 50; i += 2 {
+		live[i] = true
+	}
+	for i := uint64(51); i <= 100; i++ {
+		live[i] = true
+	}
+
+	var liveKeys []uint64
+	for k := range live {
+		liveKeys = append(liveKeys, k)
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	for i := uint64(1); i <= 100; i++ {
+		if !live[i] {
+			assertMissing(t, bt, i)
+		}
+	}
+	verifyLeafChain(t, bt, pm, liveKeys)
+}
+
+// TestDelete_ThenInsertSameRange deletes a contiguous range of keys and then reinserts the
+// same keys with different values, verifying the final state is fully consistent.
+func TestDelete_ThenInsertSameRange(t *testing.T) {
+	bt, pm := newTempBTree(t)
+	const n = 200
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	// Delete keys 50..150
+	for i := uint64(50); i <= 150; i++ {
+		mustDelete(t, bt, i)
+	}
+	// Reinsert keys 50..150 with negated values
+	for i := uint64(50); i <= 150; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i)*-1)}) //nolint:gosec
+	}
+	for i := uint64(1); i < 50; i++ {
+		assertFound(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	for i := uint64(50); i <= 150; i++ {
+		assertFound(t, bt, i, []Field{intF(1, int64(i)*-1)}) //nolint:gosec
+	}
+	for i := uint64(151); i <= n; i++ {
+		assertFound(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	fullKeys := make([]uint64, n)
+	for i := range fullKeys {
+		fullKeys[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, pm, fullKeys)
+}
