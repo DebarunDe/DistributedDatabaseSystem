@@ -392,14 +392,14 @@ func TestBufferPool_ReadPage_CacheHit_MovesToFront(t *testing.T) {
 
 	// Load 1, 2, 3 → LRU order (front→back): 3, 2, 1
 	for _, id := range []uint32{1, 2, 3} {
-		bp.ReadPage(id)
+		_, _ = bp.ReadPage(id)
 	}
 
 	// Re-read page 1 → LRU order becomes 1, 3, 2 (page 2 is LRU).
-	bp.ReadPage(1)
+	_, _ = bp.ReadPage(1)
 
 	// Reading page 4 should evict page 2 (new LRU).
-	bp.ReadPage(4)
+	_, _ = bp.ReadPage(4)
 
 	if _, exists := bp.cache[2]; exists {
 		t.Error("page 2 (LRU after re-read of page 1) should have been evicted")
@@ -480,7 +480,7 @@ func TestBufferPool_WritePage_CacheHit_MovesToFront(t *testing.T) {
 	}
 
 	// Write page 1 → should move it to front; page 2 becomes LRU.
-	bp.WritePage(makePage(1))
+	_ = bp.WritePage(makePage(1))
 
 	// Reading page 4 must evict page 2 (LRU).
 	bp.ReadPage(4)
@@ -712,10 +712,10 @@ func TestBufferPool_CacheAndLRUAlwaysInSync(t *testing.T) {
 
 	for _, op := range ops {
 		if op.write {
-			bp.WritePage(makePage(op.id))
+			_ = bp.WritePage(makePage(op.id))
 			checkSync(t, fmt.Sprintf("after WritePage(%d)", op.id))
 		} else {
-			bp.ReadPage(op.id)
+			_, _ = bp.ReadPage(op.id)
 			checkSync(t, fmt.Sprintf("after ReadPage(%d)", op.id))
 		}
 	}
@@ -1107,8 +1107,8 @@ func TestBufferPool_WritePage_AfterEviction_RequiresReadFirst(t *testing.T) {
 
 	// Load page 1, mark dirty, fill cache with page 2.
 	p1, _ := bp.ReadPage(1)
-	bp.WritePage(p1)
-	bp.ReadPage(2)
+	_ = bp.WritePage(p1)
+	_, _ = bp.ReadPage(2)
 
 	// ReadPage(3) evicts page 1 (LRU, dirty) — flushed to disk.
 	bp.ReadPage(3)

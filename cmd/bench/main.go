@@ -200,10 +200,6 @@ func fmtDur(d time.Duration) string {
 	}
 }
 
-func fmtOps(f float64) string {
-	return fmt.Sprintf("%,.0f", f)
-}
-
 // commaFormat adds thousands separators to a float formatted with no decimals.
 func commaFormat(f float64) string {
 	s := fmt.Sprintf("%.0f", f)
