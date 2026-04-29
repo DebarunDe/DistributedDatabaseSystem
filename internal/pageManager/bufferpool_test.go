@@ -476,14 +476,14 @@ func TestBufferPool_WritePage_CacheHit_MovesToFront(t *testing.T) {
 
 	// Fill cache. LRU order (front→back): 3, 2, 1
 	for _, id := range []uint32{1, 2, 3} {
-		bp.ReadPage(id)
+		_, _ = bp.ReadPage(id)
 	}
 
 	// Write page 1 → should move it to front; page 2 becomes LRU.
 	_ = bp.WritePage(makePage(1))
 
 	// Reading page 4 must evict page 2 (LRU).
-	bp.ReadPage(4)
+	_, _ = bp.ReadPage(4)
 
 	if _, exists := bp.cache[2]; exists {
 		t.Error("page 2 should have been evicted; WritePage(1) should have moved it to front")
@@ -602,11 +602,11 @@ func TestBufferPool_LRU_AccessPatternDeterminesEviction(t *testing.T) {
 	bp := newBP(disk, 3)
 
 	for _, id := range []uint32{1, 2, 3} {
-		bp.ReadPage(id)
+		_, _ = bp.ReadPage(id)
 	}
-	bp.ReadPage(1) // LRU order → 1, 3, 2
-	bp.ReadPage(3) // LRU order → 3, 1, 2 (page 2 is LRU)
-	bp.ReadPage(4) // evicts page 2
+	_, _ = bp.ReadPage(1) // LRU order → 1, 3, 2
+	_, _ = bp.ReadPage(3) // LRU order → 3, 1, 2 (page 2 is LRU)
+	_, _ = bp.ReadPage(4) // evicts page 2
 
 	if _, exists := bp.cache[2]; exists {
 		t.Error("page 2 (LRU) should have been evicted")
@@ -623,12 +623,12 @@ func TestBufferPool_SizeOne_EvictsOnEveryNewPage(t *testing.T) {
 	disk := newSpyDisk(makePage(1), makePage(2), makePage(3))
 	bp := newBP(disk, 1)
 
-	bp.ReadPage(1)
+	_, _ = bp.ReadPage(1)
 	if got := len(bp.cache); got != 1 {
 		t.Errorf("after ReadPage(1): cache size = %d, want 1", got)
 	}
 
-	bp.ReadPage(2) // evicts 1
+	_, _ = bp.ReadPage(2) // evicts 1
 	if _, exists := bp.cache[1]; exists {
 		t.Error("page 1 should have been evicted by size-1 pool")
 	}
@@ -636,7 +636,7 @@ func TestBufferPool_SizeOne_EvictsOnEveryNewPage(t *testing.T) {
 		t.Error("page 2 should be in cache")
 	}
 
-	bp.ReadPage(3) // evicts 2
+	_, _ = bp.ReadPage(3) // evicts 2
 	if _, exists := bp.cache[2]; exists {
 		t.Error("page 2 should have been evicted by size-1 pool")
 	}
@@ -749,8 +749,8 @@ func TestBufferPool_ReadPage_CacheMiss_NewPageAtFrontOfLRU(t *testing.T) {
 	disk := newSpyDisk(makePage(1), makePage(2))
 	bp := newBP(disk, 3)
 
-	bp.ReadPage(1)
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
 
 	if got := bp.lru.Front().Value.(uint32); got != 2 {
 		t.Errorf("LRU front = %d after ReadPage(2), want 2", got)
@@ -804,9 +804,9 @@ func TestBufferPool_ReadPage_EvictedPage_HitsDiskAgain(t *testing.T) {
 	disk := newSpyDisk(makePage(1), makePage(2), makePage(3))
 	bp := newBP(disk, 2)
 
-	bp.ReadPage(1) // cache: {1}
-	bp.ReadPage(2) // cache: {1, 2}
-	bp.ReadPage(3) // evicts 1; cache: {2, 3}
+	_, _ = bp.ReadPage(1) // cache: {1}
+	_, _ = bp.ReadPage(2) // cache: {1, 2}
+	_, _ = bp.ReadPage(3) // evicts 1; cache: {2, 3}
 
 	if _, exists := bp.cache[1]; exists {
 		t.Fatal("page 1 should have been evicted")
@@ -1005,8 +1005,8 @@ func TestBufferPool_WritePage_CacheHit_NoEviction(t *testing.T) {
 	bp := newBP(disk, 2)
 
 	// Fill cache to capacity: {1, 2}.
-	bp.ReadPage(1)
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
 
 	// Write page 1 again (cache hit). Cache is still at capacity — no eviction should happen.
 	if err := bp.WritePage(makePage(1)); err != nil {
@@ -1058,7 +1058,7 @@ func TestBufferPool_WritePage_CacheHit_CleanPageBecomesMarkedDirty(t *testing.T)
 	disk := newSpyDisk(makePage(1))
 	bp := newBP(disk, 3)
 
-	bp.ReadPage(1)
+	_, _ = bp.ReadPage(1)
 	if bp.cache[1].modified {
 		t.Fatal("page 1 should be clean after ReadPage")
 	}
@@ -1111,7 +1111,7 @@ func TestBufferPool_WritePage_AfterEviction_RequiresReadFirst(t *testing.T) {
 	_, _ = bp.ReadPage(2)
 
 	// ReadPage(3) evicts page 1 (LRU, dirty) — flushed to disk.
-	bp.ReadPage(3)
+	_, _ = bp.ReadPage(3)
 	if _, exists := bp.cache[1]; exists {
 		t.Fatal("page 1 should have been evicted")
 	}
@@ -1137,11 +1137,11 @@ func TestBufferPool_WritePage_LRUOrder_AfterMixedOps(t *testing.T) {
 	bp := newBP(disk, 5)
 
 	// Load 1, 2, 3 → order (front→back): 3, 2, 1
-	bp.ReadPage(1)
-	bp.ReadPage(2)
-	bp.ReadPage(3)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
+	_, _ = bp.ReadPage(3)
 	// Write 1 (cache hit, move to front) → order: 1, 3, 2
-	bp.WritePage(makePage(1))
+	_ = bp.WritePage(makePage(1))
 
 	want := []uint32{1, 3, 2}
 	got := lruIDs(bp)
@@ -1221,8 +1221,8 @@ func TestBufferPool_AllocatePage_TriggersEviction(t *testing.T) {
 	bp := newBP(disk, 2)
 
 	// Fill cache: {1 (LRU), 2 (MRU)}
-	bp.ReadPage(1)
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
 
 	if _, err := bp.AllocatePage(); err != nil {
 		t.Fatalf("AllocatePage: %v", err)
@@ -1266,9 +1266,9 @@ func TestBufferPool_AllocatePage_EvictionFails_Rollback(t *testing.T) {
 	bp := newBP(disk, 2)
 
 	// Fill cache: page 1 (LRU, dirty), page 2 (MRU).
-	bp.ReadPage(1)
-	bp.WritePage(makePage(1))
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_ = bp.WritePage(makePage(1))
+	_, _ = bp.ReadPage(2)
 
 	// Make disk writes fail so eviction of dirty page 1 fails.
 	disk.writeFn = func(*Page) error { return errors.New("disk error") }
@@ -1298,9 +1298,9 @@ func TestBufferPool_AllocatePage_EvictionFails_FreeAlsoFails(t *testing.T) {
 	disk.allocateFn = func() (*Page, error) { return makePage(3), nil }
 	bp := newBP(disk, 2)
 
-	bp.ReadPage(1)
-	bp.WritePage(makePage(1))
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_ = bp.WritePage(makePage(1))
+	_, _ = bp.ReadPage(2)
 
 	disk.writeFn = func(*Page) error { return errors.New("disk write error") }
 	disk.freeFn = func(uint32) error { return errors.New("disk free error") }
@@ -1343,7 +1343,7 @@ func TestBufferPool_AllocatePage_CacheAndLRUConsistentAfterEviction(t *testing.T
 	bp := newBP(disk, 3)
 
 	for _, id := range []uint32{1, 2, 3} {
-		bp.ReadPage(id)
+		_, _ = bp.ReadPage(id)
 	}
 	for i := 0; i < 3; i++ {
 		if _, err := bp.AllocatePage(); err != nil {
@@ -1368,7 +1368,7 @@ func TestBufferPool_FreePage_CachedCleanPage_RemovedFromCache(t *testing.T) {
 	disk.freeFn = func(uint32) error { return nil }
 	bp := newBP(disk, 3)
 
-	bp.ReadPage(1)
+	_, _ = bp.ReadPage(1)
 
 	if err := bp.FreePage(1); err != nil {
 		t.Fatalf("FreePage(1): %v", err)
@@ -1389,7 +1389,7 @@ func TestBufferPool_FreePage_DirtyPage_RemovedWithoutFlush(t *testing.T) {
 
 	p, _ := bp.ReadPage(1)
 	markByte(p, 0xFF)
-	bp.WritePage(p)
+	_ = bp.WritePage(p)
 
 	writesBefore := disk.writeCount
 
@@ -1425,7 +1425,7 @@ func TestBufferPool_FreePage_DiskError_CacheUnchanged(t *testing.T) {
 	disk.freeFn = func(uint32) error { return errors.New("disk error") }
 	bp := newBP(disk, 3)
 
-	bp.ReadPage(1)
+	_, _ = bp.ReadPage(1)
 
 	if err := bp.FreePage(1); err == nil {
 		t.Fatal("FreePage should return error when disk.FreePage fails")
@@ -1445,7 +1445,7 @@ func TestBufferPool_FreePage_CacheAndLRUConsistent(t *testing.T) {
 	bp := newBP(disk, 5)
 
 	for _, id := range []uint32{1, 2, 3} {
-		bp.ReadPage(id)
+		_, _ = bp.ReadPage(id)
 	}
 	if err := bp.FreePage(2); err != nil {
 		t.Fatalf("FreePage(2): %v", err)
@@ -1521,11 +1521,11 @@ func TestBufferPool_Close_FlushesDirtyPages(t *testing.T) {
 	// Dirty pages 1 and 3; leave page 2 clean.
 	p1, _ := bp.ReadPage(1)
 	markByte(p1, 0xAA)
-	bp.WritePage(p1)
-	bp.ReadPage(2)
+	_ = bp.WritePage(p1)
+	_, _ = bp.ReadPage(2)
 	p3, _ := bp.ReadPage(3)
 	markByte(p3, 0xBB)
-	bp.WritePage(p3)
+	_ = bp.WritePage(p3)
 
 	writesBefore := disk.writeCount
 
@@ -1546,8 +1546,8 @@ func TestBufferPool_Close_CleanPages_NotFlushed(t *testing.T) {
 	disk.closeFn = func() error { return nil }
 	bp := newBP(disk, 5)
 
-	bp.ReadPage(1)
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
 
 	writesBefore := disk.writeCount
 
@@ -1565,8 +1565,8 @@ func TestBufferPool_Close_ClearsCache(t *testing.T) {
 	disk.closeFn = func() error { return nil }
 	bp := newBP(disk, 5)
 
-	bp.ReadPage(1)
-	bp.ReadPage(2)
+	_, _ = bp.ReadPage(1)
+	_, _ = bp.ReadPage(2)
 
 	if err := bp.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1600,7 +1600,7 @@ func TestBufferPool_Close_DirtyFlushError_DiskCloseNotCalled(t *testing.T) {
 	bp := newBP(disk, 3)
 
 	p, _ := bp.ReadPage(1)
-	bp.WritePage(p)
+	_ = bp.WritePage(p)
 
 	disk.writeFn = func(*Page) error { return errors.New("flush error") }
 
@@ -1620,7 +1620,7 @@ func TestBufferPool_Close_FlushedData_MatchesModification(t *testing.T) {
 
 	page, _ := bp.ReadPage(1)
 	markByte(page, 0xCD)
-	bp.WritePage(page)
+	_ = bp.WritePage(page)
 
 	if err := bp.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1642,8 +1642,8 @@ func TestBufferPool_Delete_ClearsCache_CallsDiskDelete(t *testing.T) {
 
 	p1, _ := bp.ReadPage(1)
 	markByte(p1, 0xFF)
-	bp.WritePage(p1)
-	bp.ReadPage(2)
+	_ = bp.WritePage(p1)
+	_, _ = bp.ReadPage(2)
 
 	writesBefore := disk.writeCount
 
