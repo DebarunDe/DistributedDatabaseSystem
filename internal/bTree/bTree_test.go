@@ -10300,3 +10300,683 @@ func TestRangeScan_ConsistentWithSearch(t *testing.T) {
 		assertFields(t, r.Fields, fields)
 	}
 }
+
+// ── Buffer Pool BTree integration tests ──────────────────────────────────────
+//
+// These tests verify all three properties of a BufferPoolImpl-backed BTree:
+//
+//  1. Correctness parity — every BTree operation produces the same result as
+//     the direct-disk PageManagerImpl path tested above.
+//  2. Eviction robustness — correctness holds even with a tiny cache (size 5)
+//     that evicts pages during multi-page operations (splits, merges).
+//  3. Durability — Close flushes all dirty pages; a freshly-opened buffer pool
+//     on the same file sees every previously committed record.
+//
+// Cache size choice: a leaf record with a 180-byte string payload occupies ~196
+// bytes including its slot-directory entry. A 4 KB leaf page holds ~20 such
+// records. The minimum concurrent working set during any single BTree operation
+// (leaf split with right sibling + parent write) is 4 pages. Cache size 5
+// provides one page of margin and is safe for all operations tested here.
+
+// newBPBTree creates a BTree backed by a BufferPool wrapping an on-disk
+// PageManagerImpl. cacheSize controls the number of cached pages; small values
+// exercise the eviction path.
+func newBPBTree(t *testing.T, cacheSize int) (*BTree, pagemanager.PageManager) {
+	t.Helper()
+	path := t.TempDir() + "/btree_bp.db"
+	disk, err := pagemanager.NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	t.Cleanup(func() { _ = bp.Delete() })
+	return NewBTree(bp), bp
+}
+
+// newBPBTreeForDurability is like newBPBTree but returns the file path so the
+// test can close and re-open the store. The caller is responsible for lifecycle
+// management of the returned PageManager.
+func newBPBTreeForDurability(t *testing.T, cacheSize int) (*BTree, pagemanager.PageManager, string) {
+	t.Helper()
+	path := t.TempDir() + "/btree_bp.db"
+	disk, err := pagemanager.NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	t.Cleanup(func() { _ = bp.Close() })
+	return NewBTree(bp), bp, path
+}
+
+// openBPBTree opens an existing database file behind a fresh buffer pool.
+func openBPBTree(t *testing.T, path string, cacheSize int) (*BTree, pagemanager.PageManager) {
+	t.Helper()
+	disk, err := pagemanager.OpenDB(path)
+	if err != nil {
+		t.Fatalf("OpenDB(%q): %v", path, err)
+	}
+	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	return NewBTree(bp), bp
+}
+
+// bpBigVal returns a 180-byte string, making each leaf record ~196 bytes so
+// that ~20 inserts fill one leaf page and trigger a split.
+func bpBigVal(c byte) string { return repeatedStr(c, 180) }
+
+// ── Correctness parity ─────────────────────────────────────────────────────
+
+// TestBP_Search_EmptyTree verifies Search on a freshly-created buffer-pooled
+// tree returns (nil, false, nil).
+func TestBP_Search_EmptyTree(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	_, found, err := bt.Search(42)
+	if err != nil || found {
+		t.Fatalf("expected (nil,false,nil), got (_, %v, %v)", found, err)
+	}
+}
+
+// TestBP_Search_HitAndMiss inserts one record and verifies a hit on the exact
+// key and misses on neighbouring keys.
+func TestBP_Search_HitAndMiss(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	mustInsert(t, bt, 42, []Field{intF(1, 100)})
+
+	assertFound(t, bt, 42, []Field{intF(1, 100)})
+	assertMissing(t, bt, 41)
+	assertMissing(t, bt, 43)
+}
+
+// TestBP_Insert_Sequential inserts keys 1–30 in order and finds every one.
+func TestBP_Insert_Sequential(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	const n = 30
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	for i := uint64(1); i <= n; i++ {
+		assertFound(t, bt, i, []Field{intF(1, int64(i))})
+	}
+}
+
+// TestBP_Insert_Reverse inserts keys in descending order and verifies all are
+// found, confirming the tree handles non-sequential inserts correctly.
+func TestBP_Insert_Reverse(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	const n = 20
+	for i := uint64(n); i >= 1; i-- {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	for i := uint64(1); i <= n; i++ {
+		assertFound(t, bt, i, []Field{intF(1, int64(i))})
+	}
+}
+
+// TestBP_Insert_Random inserts keys in a non-monotone order and verifies all
+// are searchable and the leaf chain is intact.
+func TestBP_Insert_Random(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	keys := []uint64{15, 3, 22, 8, 1, 19, 11, 27, 6, 14, 30, 2, 18, 9, 24}
+	for _, k := range keys {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	sorted := make([]uint64, len(keys))
+	copy(sorted, keys)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	for _, k := range sorted {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, bp, sorted)
+}
+
+// TestBP_Insert_DuplicateKey_Updates re-inserts an existing key with a new
+// value and verifies the updated value is returned by Search.
+func TestBP_Insert_DuplicateKey_Updates(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	mustInsert(t, bt, 7, []Field{intF(1, 100)})
+	assertFound(t, bt, 7, []Field{intF(1, 100)})
+
+	mustInsert(t, bt, 7, []Field{intF(1, 999)})
+	assertFound(t, bt, 7, []Field{intF(1, 999)})
+}
+
+// TestBP_Insert_TriggersSplit inserts 21 large records to force a leaf split
+// and verifies every key is searchable and the leaf chain is intact.
+func TestBP_Insert_TriggersSplit(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('x')
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	keys := make([]uint64, 21)
+	for i := range keys {
+		keys[i] = uint64(i + 1)
+	}
+	for _, k := range keys {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt, bp, keys)
+}
+
+// TestBP_Delete_EmptyTree_NoOp verifies Delete on an empty tree returns nil.
+func TestBP_Delete_EmptyTree_NoOp(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	mustDelete(t, bt, 42)
+	assertTreeEmpty(t, bp)
+}
+
+// TestBP_Delete_OnlyRecord_EmptiesTree inserts one record, deletes it, and
+// verifies the tree is empty and the key is no longer found.
+func TestBP_Delete_OnlyRecord_EmptiesTree(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	mustInsert(t, bt, 55, []Field{intF(1, 55)})
+	mustDelete(t, bt, 55)
+	assertTreeEmpty(t, bp)
+	assertMissing(t, bt, 55)
+}
+
+// TestBP_Delete_MultiRecord deletes several specific keys from a tree and
+// verifies the remaining keys are all still searchable.
+func TestBP_Delete_MultiRecord(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	const n = 10
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	mustDelete(t, bt, 1)
+	mustDelete(t, bt, 5)
+	mustDelete(t, bt, 10)
+	assertMissing(t, bt, 1)
+	assertMissing(t, bt, 5)
+	assertMissing(t, bt, 10)
+	remaining := []uint64{2, 3, 4, 6, 7, 8, 9}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	verifyLeafChain(t, bt, bp, remaining)
+}
+
+// TestBP_Delete_TriggersMerge builds a split tree (21 large records) and
+// deletes enough keys to trigger redistribution followed by a merge and tree
+// collapse. Verifies all remaining data is intact.
+func TestBP_Delete_TriggersMerge(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('m')
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	mustDelete(t, bt, 1) // redistribute
+	mustDelete(t, bt, 2) // merge + collapse to single leaf root
+	assertRootIsLeaf(t, bp)
+	remaining := make([]uint64, 0, 19)
+	for i := uint64(3); i <= 21; i++ {
+		remaining = append(remaining, i)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	assertMissing(t, bt, 1)
+	assertMissing(t, bt, 2)
+	verifyLeafChain(t, bt, bp, remaining)
+}
+
+// TestBP_Delete_MissingKey_NoOp verifies that deleting a non-existent key
+// leaves all existing records unchanged.
+func TestBP_Delete_MissingKey_NoOp(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	for _, k := range []uint64{10, 20, 30} {
+		mustInsert(t, bt, k, []Field{intF(1, int64(k))})
+	}
+	mustDelete(t, bt, 15)
+	for _, k := range []uint64{10, 20, 30} {
+		assertFound(t, bt, k, []Field{intF(1, int64(k))})
+	}
+}
+
+// TestBP_RangeScan_EmptyTree returns no results for an empty buffer-pooled tree.
+func TestBP_RangeScan_EmptyTree(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	results := mustRangeScan(t, bt, 1, 100)
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
+	}
+}
+
+// TestBP_RangeScan_AllKeys scans the entire range and verifies every inserted
+// key is returned in ascending order.
+func TestBP_RangeScan_AllKeys(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	const n = 15
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	results := mustRangeScan(t, bt, 1, n)
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestBP_RangeScan_PartialRange returns only the keys within the requested
+// sub-range, excluding those outside the bounds.
+func TestBP_RangeScan_PartialRange(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	for i := uint64(1); i <= 20; i++ {
+		mustInsert(t, bt, i, []Field{intF(1, int64(i))})
+	}
+	results := mustRangeScan(t, bt, 5, 15)
+	want := make([]uint64, 11)
+	for i := range want {
+		want[i] = uint64(5 + i)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestBP_LeafChain_IntactAfterSplit inserts 21 large records (enough to trigger
+// a leaf split) and verifies the doubly-linked sibling chain is intact and
+// strictly ascending.
+func TestBP_LeafChain_IntactAfterSplit(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('z')
+	const n = 21
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, bp, want)
+}
+
+// ── Eviction robustness ────────────────────────────────────────────────────
+//
+// Cache size 5 is used: small enough to force evictions across multi-page
+// operations, large enough to safely hold the concurrent working set of any
+// single BTree operation (leaf split with right sibling = 4 pages).
+
+// TestBP_TinyCache_Insert_AllKeysFound inserts 30 large records with a tiny
+// cache. Pages are evicted and re-loaded many times; all keys must be found.
+func TestBP_TinyCache_Insert_AllKeysFound(t *testing.T) {
+	bt, bp := newBPBTree(t, 5)
+	val := bpBigVal('e')
+	const n = 30
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	keys := make([]uint64, n)
+	for i := range keys {
+		keys[i] = uint64(i + 1)
+	}
+	for _, k := range keys {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt, bp, keys)
+}
+
+// TestBP_TinyCache_Delete_Correct inserts 21 large records, then deletes a
+// subset with a tiny cache, verifying the remaining records and leaf chain.
+func TestBP_TinyCache_Delete_Correct(t *testing.T) {
+	bt, bp := newBPBTree(t, 5)
+	val := bpBigVal('d')
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	for _, del := range []uint64{1, 3, 5, 7, 9} {
+		mustDelete(t, bt, del)
+	}
+	remaining := make([]uint64, 0, 16)
+	for i := uint64(1); i <= 21; i++ {
+		if i%2 == 0 || i > 9 {
+			remaining = append(remaining, i)
+		}
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt, bp, remaining)
+}
+
+// TestBP_TinyCache_RangeScan_Correct builds a split tree with a tiny cache and
+// verifies a range scan returns exactly the expected keys in order.
+func TestBP_TinyCache_RangeScan_Correct(t *testing.T) {
+	bt, _ := newBPBTree(t, 5)
+	val := bpBigVal('r')
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	results := mustRangeScan(t, bt, 5, 15)
+	want := make([]uint64, 11)
+	for i := range want {
+		want[i] = uint64(5 + i)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestBP_TinyCache_LeafChain_Intact verifies the leaf sibling chain is intact
+// and strictly ascending after many inserts with a tiny cache.
+func TestBP_TinyCache_LeafChain_Intact(t *testing.T) {
+	bt, bp := newBPBTree(t, 5)
+	val := bpBigVal('l')
+	const n = 21
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, bp, want)
+}
+
+// TestBP_TinyCache_MixedOps exercises insert, delete, search, and range scan
+// interleaved under a tiny cache, verifying tree integrity after each phase.
+func TestBP_TinyCache_MixedOps(t *testing.T) {
+	bt, bp := newBPBTree(t, 5)
+	val := bpBigVal('p')
+
+	// Phase 1: insert 21 records (triggers split).
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	// Phase 2: delete odd keys.
+	for i := uint64(1); i <= 21; i += 2 {
+		mustDelete(t, bt, i)
+	}
+	// Phase 3: re-insert deleted keys with an updated value.
+	val2 := bpBigVal('q')
+	for i := uint64(1); i <= 21; i += 2 {
+		mustInsert(t, bt, i, []Field{strF(1, val2)})
+	}
+	for i := uint64(1); i <= 21; i++ {
+		if i%2 == 0 {
+			assertFound(t, bt, i, []Field{strF(1, val)})
+		} else {
+			assertFound(t, bt, i, []Field{strF(1, val2)})
+		}
+	}
+	want := make([]uint64, 21)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, bp, want)
+}
+
+// TestBP_TinyCache_TriggersMerge verifies that a merge + tree collapse works
+// correctly even under a tiny cache that evicts pages during the merge.
+func TestBP_TinyCache_TriggersMerge(t *testing.T) {
+	bt, bp := newBPBTree(t, 5)
+	val := bpBigVal('g')
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	mustDelete(t, bt, 1) // redistribute
+	mustDelete(t, bt, 2) // merge + collapse
+	assertRootIsLeaf(t, bp)
+	remaining := make([]uint64, 0, 19)
+	for i := uint64(3); i <= 21; i++ {
+		remaining = append(remaining, i)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt, bp, remaining)
+}
+
+// ── Durability ─────────────────────────────────────────────────────────────
+//
+// These tests close the buffer pool (which flushes dirty pages to disk) and
+// reopen the file behind a fresh buffer pool, verifying that all mutations
+// survive the close-reopen cycle.
+
+// TestBP_Durability_InsertThenClose_DataPersists inserts records, calls Close
+// to flush all dirty pages, reopens the file, and verifies every key is found.
+func TestBP_Durability_InsertThenClose_DataPersists(t *testing.T) {
+	val := bpBigVal('p')
+	keys := []uint64{10, 20, 30, 40, 50}
+
+	bt1, bp1, path := newBPBTreeForDurability(t, 10)
+	for _, k := range keys {
+		mustInsert(t, bt1, k, []Field{strF(1, val)})
+	}
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+	for _, k := range keys {
+		assertFound(t, bt2, k, []Field{strF(1, val)})
+	}
+	assertMissing(t, bt2, 15)
+}
+
+// TestBP_Durability_DeleteThenClose_DataPersists inserts a set of records,
+// deletes some, closes, reopens, and verifies only the surviving keys remain.
+func TestBP_Durability_DeleteThenClose_DataPersists(t *testing.T) {
+	val := bpBigVal('t')
+
+	bt1, bp1, path := newBPBTreeForDurability(t, 10)
+	for i := uint64(1); i <= 10; i++ {
+		mustInsert(t, bt1, i, []Field{strF(1, val)})
+	}
+	mustDelete(t, bt1, 2)
+	mustDelete(t, bt1, 5)
+	mustDelete(t, bt1, 9)
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+	for i := uint64(1); i <= 10; i++ {
+		if i == 2 || i == 5 || i == 9 {
+			assertMissing(t, bt2, i)
+		} else {
+			assertFound(t, bt2, i, []Field{strF(1, val)})
+		}
+	}
+}
+
+// TestBP_Durability_SmallCache_DataPersistsAfterClose builds a split tree with
+// a tiny cache (heavy eviction during writes), closes it, and verifies data
+// survives the close-reopen cycle.
+func TestBP_Durability_SmallCache_DataPersistsAfterClose(t *testing.T) {
+	val := bpBigVal('s')
+	const n = 21
+
+	bt1, bp1, path := newBPBTreeForDurability(t, 5)
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt1, i, []Field{strF(1, val)})
+	}
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+	keys := make([]uint64, n)
+	for i := range keys {
+		keys[i] = uint64(i + 1)
+	}
+	for _, k := range keys {
+		assertFound(t, bt2, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt2, bp2, keys)
+}
+
+// TestBP_Durability_RangeScan_AfterClose inserts records, closes, reopens, and
+// verifies a range scan returns the correct subset of keys.
+func TestBP_Durability_RangeScan_AfterClose(t *testing.T) {
+	bt1, bp1, path := newBPBTreeForDurability(t, 10)
+	for i := uint64(1); i <= 20; i++ {
+		mustInsert(t, bt1, i, []Field{intF(1, int64(i))})
+	}
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+
+	results := mustRangeScan(t, bt2, 5, 15)
+	want := make([]uint64, 11)
+	for i := range want {
+		want[i] = uint64(5 + i)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
+
+// TestBP_Durability_EmptyTree_AfterClose verifies that deleting the only
+// record, closing, and reopening results in a properly empty tree.
+func TestBP_Durability_EmptyTree_AfterClose(t *testing.T) {
+	bt1, bp1, path := newBPBTreeForDurability(t, 10)
+	mustInsert(t, bt1, 42, []Field{intF(1, 42)})
+	mustDelete(t, bt1, 42)
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+	assertTreeEmpty(t, bp2)
+	assertMissing(t, bt2, 42)
+}
+
+// TestBP_Durability_Update_AfterClose inserts a key, overwrites it with a new
+// value, closes, reopens, and verifies the latest value is present.
+func TestBP_Durability_Update_AfterClose(t *testing.T) {
+	bt1, bp1, path := newBPBTreeForDurability(t, 10)
+	mustInsert(t, bt1, 99, []Field{intF(1, 1)})
+	mustInsert(t, bt1, 99, []Field{intF(1, 2)}) // overwrite
+	if err := bp1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	bt2, bp2 := openBPBTree(t, path, 10)
+	defer func() { _ = bp2.Delete() }()
+	assertFound(t, bt2, 99, []Field{intF(1, 2)})
+}
+
+// ── Large workload ─────────────────────────────────────────────────────────
+
+// TestBP_LargeWorkload_Sequential inserts 50 large records in order with a
+// standard cache size, verifying all are searchable and the leaf chain is intact.
+func TestBP_LargeWorkload_Sequential(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('w')
+	const n = 50
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	keys := make([]uint64, n)
+	for i := range keys {
+		keys[i] = uint64(i + 1)
+	}
+	for _, k := range keys {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	verifyLeafChain(t, bt, bp, keys)
+}
+
+// TestBP_LargeWorkload_AllKeys_LeafChainOrdered verifies the leaf sibling chain
+// is strictly ascending across all pages of a large tree (60 records spanning
+// multiple leaf pages).
+func TestBP_LargeWorkload_AllKeys_LeafChainOrdered(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('o')
+	const n = 60
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, bp, want)
+}
+
+// TestBP_LargeWorkload_DeleteHalf inserts 42 large records, deletes the
+// even-numbered keys, and verifies only the odd-numbered keys remain.
+func TestBP_LargeWorkload_DeleteHalf(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('h')
+	const n = 42
+	for i := uint64(1); i <= n; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	for i := uint64(2); i <= n; i += 2 {
+		mustDelete(t, bt, i)
+	}
+	remaining := make([]uint64, 0, n/2)
+	for i := uint64(1); i <= n; i += 2 {
+		remaining = append(remaining, i)
+	}
+	for _, k := range remaining {
+		assertFound(t, bt, k, []Field{strF(1, val)})
+	}
+	for i := uint64(2); i <= n; i += 2 {
+		assertMissing(t, bt, i)
+	}
+	verifyLeafChain(t, bt, bp, remaining)
+}
+
+// TestBP_MixedWorkload_InsertDeleteSearch interleaves insertions, deletions,
+// and searches across three phases, verifying tree state after each.
+func TestBP_MixedWorkload_InsertDeleteSearch(t *testing.T) {
+	bt, bp := newBPBTree(t, 10)
+	val := bpBigVal('i')
+
+	// Phase 1: insert keys 1–21 (triggers leaf split).
+	for i := uint64(1); i <= 21; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	// Phase 2: delete keys 1–10; verify 11–21 remain.
+	for i := uint64(1); i <= 10; i++ {
+		mustDelete(t, bt, i)
+	}
+	for i := uint64(1); i <= 10; i++ {
+		assertMissing(t, bt, i)
+	}
+	for i := uint64(11); i <= 21; i++ {
+		assertFound(t, bt, i, []Field{strF(1, val)})
+	}
+	// Phase 3: re-insert keys 1–10 with an updated value.
+	val2 := bpBigVal('j')
+	for i := uint64(1); i <= 10; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val2)})
+	}
+	for i := uint64(1); i <= 10; i++ {
+		assertFound(t, bt, i, []Field{strF(1, val2)})
+	}
+	for i := uint64(11); i <= 21; i++ {
+		assertFound(t, bt, i, []Field{strF(1, val)})
+	}
+	want := make([]uint64, 21)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	verifyLeafChain(t, bt, bp, want)
+}
+
+// TestBP_RangeScan_SpansMultiplePages verifies that a range scan spanning
+// multiple leaf pages (42 records across ≥ 2 leaf pages) returns all keys
+// in ascending order.
+func TestBP_RangeScan_SpansMultiplePages(t *testing.T) {
+	bt, _ := newBPBTree(t, 10)
+	val := bpBigVal('v')
+	for i := uint64(1); i <= 42; i++ {
+		mustInsert(t, bt, i, []Field{strF(1, val)})
+	}
+	results := mustRangeScan(t, bt, 1, 42)
+	want := make([]uint64, 42)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	assertRangeScanKeys(t, results, want)
+	assertRangeScanAscending(t, results)
+}
