@@ -48,7 +48,11 @@ func setupBufferPool(path string, cacheSize int) (pagemanager.PageManager, error
 	if err != nil {
 		return nil, err
 	}
-	return pagemanager.NewBufferPool(disk, cacheSize), nil
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		return nil, err
+	}
+	return pagemanager.NewBufferPool(wal, cacheSize), nil
 }
 
 func newTempDB(backendType string) (pagemanager.PageManager, func(), error) {

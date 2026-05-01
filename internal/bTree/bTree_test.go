@@ -10328,7 +10328,11 @@ func newBPBTree(t *testing.T, cacheSize int) (*BTree, pagemanager.PageManager) {
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		t.Fatalf("NewWAL: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(wal, cacheSize)
 	t.Cleanup(func() { _ = bp.Delete() })
 	return NewBTree(bp), bp
 }
@@ -10343,7 +10347,11 @@ func newBPBTreeForDurability(t *testing.T, cacheSize int) (*BTree, pagemanager.P
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}
-	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		t.Fatalf("NewWAL: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(wal, cacheSize)
 	t.Cleanup(func() { _ = bp.Close() })
 	return NewBTree(bp), bp, path
 }
@@ -10355,7 +10363,11 @@ func openBPBTree(t *testing.T, path string, cacheSize int) (*BTree, pagemanager.
 	if err != nil {
 		t.Fatalf("OpenDB(%q): %v", path, err)
 	}
-	bp := pagemanager.NewBufferPool(disk, cacheSize)
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		t.Fatalf("NewWAL: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(wal, cacheSize)
 	return NewBTree(bp), bp
 }
 
