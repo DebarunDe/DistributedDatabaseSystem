@@ -3,6 +3,7 @@ package pagemanager
 import (
 	"container/list"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -38,6 +39,13 @@ type BufferPoolImpl struct {
 	lru       *list.List // list of page IDs, with the most recently used at the front and least recently used at the back
 }
 
+// WALImpl struct
+type WALImpl struct {
+	disk              PageManager
+	file              *os.File
+	logSequenceNumber uint64
+}
+
 // Bufferpool specific methods
 // Evict evicts the least recently used page from the buffer pool.
 func (bp *BufferPoolImpl) Evict() error {
@@ -60,6 +68,62 @@ func (bp *BufferPoolImpl) Evict() error {
 	// Remove the page from the cache and the LRU list
 	delete(bp.cache, lruElement.Value.(uint32))
 	bp.lru.Remove(lruElement)
+
+	return nil
+}
+
+// WAL specific methods
+// RecoverFromWAL reads the WAL file and replays any log records to recover the database to a consistent state after a crash.
+func RecoverFromWAL(walPath string, pm *PageManagerImpl) error {
+	walFile, err := os.OpenFile(walPath, os.O_RDWR, 0644)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to open WAL file: %w", err)
+	}
+	defer walFile.Close()
+
+	record := &WAL{}
+	for {
+		_, err := io.ReadFull(walFile, record.Data[:])
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break // reached end of file
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read WAL record: %w", err)
+		}
+
+		if !record.ValidateCRC32() {
+			break // stop replaying if we encounter a record with invalid CRC, as it indicates we've reached the end of valid log records
+		}
+		// Apply the page update from the WAL record to the page manager if wal record lsn > page lsn
+		fileOffset := int64(record.GetPageID()) * PageSize
+
+		currentPage := &Page{}
+		if _, err := pm.file.ReadAt(currentPage.Data[:], fileOffset); err != nil {
+			return fmt.Errorf("failed to read page %d during recovery: %w", record.GetPageID(), err)
+		}
+
+		if record.GetLSN() > currentPage.GetPageLSN() {
+			if _, err := pm.file.WriteAt(record.GetPageData(), fileOffset); err != nil {
+				return fmt.Errorf("failed to apply WAL record to page manager: %w", err)
+			}
+		}
+	}
+
+	// After replaying all valid WAL records, we should sync the file to ensure all changes are flushed to disk before we return from recovery.
+	if err := pm.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync page manager file after WAL recovery: %w", err)
+	}
+
+	if _, err := pm.file.ReadAt(pm.metaPage.Data[:], 0); err != nil {
+		return fmt.Errorf("failed to read meta page after WAL recovery: %w", err)
+	}
+
+	if err := walFile.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate WAL file after recovery: %w", err)
+	}
 
 	return nil
 }
@@ -135,6 +199,16 @@ func (bp *BufferPoolImpl) AllocatePage() (*Page, error) {
 	return page, nil
 }
 
+func (wal *WALImpl) AllocatePage() (*Page, error) {
+	// WAL does not manage page allocation directly, it delegates to the underlying disk page manager
+	page, err := wal.disk.AllocatePage()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate page from disk: %w", err)
+	}
+
+	return page, nil
+}
+
 // ReadPage reads a page from disk.
 func (pm *PageManagerImpl) ReadPage(pageId uint32) (*Page, error) {
 	if pm.file == nil {
@@ -189,6 +263,16 @@ func (bp *BufferPoolImpl) ReadPage(pageId uint32) (*Page, error) {
 	return page, nil
 }
 
+func (wal *WALImpl) ReadPage(pageId uint32) (*Page, error) {
+	// WAL does not manage page reads directly, it delegates to the underlying disk page manager
+	page, err := wal.disk.ReadPage(pageId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read page from disk: %w", err)
+	}
+
+	return page, nil
+}
+
 // WritePage writes a page to disk.
 func (pm *PageManagerImpl) WritePage(p *Page) error {
 	if pm.file == nil {
@@ -218,6 +302,38 @@ func (bp *BufferPoolImpl) WritePage(p *Page) error {
 
 	cacheValue.modified = true
 	bp.lru.MoveToFront(cacheValue.node)
+
+	return nil
+}
+
+func (wal *WALImpl) WritePage(p *Page) error {
+	//set Page LSN to current WAL LSN
+	p.setPageLSN(wal.logSequenceNumber)
+
+	// create a WAL record for this page write
+	walRecord := &WAL{}
+	walRecord.SetLSN(wal.logSequenceNumber)
+	walRecord.SetPageID(p.GetPageId())
+	walRecord.SetPageData(p)
+	walRecord.SetCRC32(walRecord.CalculateCRC32())
+
+	// Append the WAL record to the end of the WAL file
+	if _, err := wal.file.Write(walRecord.Data[:]); err != nil {
+		return fmt.Errorf("failed to write WAL record to file: %w", err)
+	}
+
+	//Sync the WAL file to ensure durability of the log record
+	if err := wal.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL file: %w", err)
+	}
+
+	// Increment the WAL LSN for the next record
+	wal.logSequenceNumber++
+
+	// pass the page write through to the underlying disk page manager
+	if err := wal.disk.WritePage(p); err != nil {
+		return fmt.Errorf("failed to write page to disk: %w", err)
+	}
 
 	return nil
 }
@@ -279,6 +395,15 @@ func (bp *BufferPoolImpl) FreePage(pageId uint32) error {
 	return nil
 }
 
+func (wal *WALImpl) FreePage(pageId uint32) error {
+	// WAL does not manage page frees directly, it delegates to the underlying disk page manager
+	if err := wal.disk.FreePage(pageId); err != nil {
+		return fmt.Errorf("failed to free page on disk: %w", err)
+	}
+
+	return nil
+}
+
 // GetRootPageId returns the root page id.
 func (pm *PageManagerImpl) GetRootPageId() uint32 {
 	return pm.metaPage.GetMetaRootPage()
@@ -287,6 +412,13 @@ func (pm *PageManagerImpl) GetRootPageId() uint32 {
 func (bp *BufferPoolImpl) GetRootPageId() uint32 {
 	// The root page ID is stored in the meta page, which is managed by the disk layer. We can read it directly from the disk.
 	rootPageId := bp.disk.GetRootPageId()
+	return rootPageId
+}
+
+func (wal *WALImpl) GetRootPageId() uint32 {
+	// The root page ID is stored in the meta page, which is managed by the disk layer. We can read it directly from the disk.
+	rootPageId := wal.disk.GetRootPageId()
+
 	return rootPageId
 }
 
@@ -307,6 +439,15 @@ func (bp *BufferPoolImpl) SetRootPageId(pageId uint32) error {
 	if err := bp.disk.SetRootPageId(pageId); err != nil {
 		return fmt.Errorf("failed to set root page id on disk: %w", err)
 	}
+	return nil
+}
+
+func (wal *WALImpl) SetRootPageId(pageId uint32) error {
+	// The root page ID is stored in the meta page, which is managed by the disk layer. We can update it directly on the disk.
+	if err := wal.disk.SetRootPageId(pageId); err != nil {
+		return fmt.Errorf("failed to set root page id on disk: %w", err)
+	}
+
 	return nil
 }
 
@@ -354,6 +495,25 @@ func (bp *BufferPoolImpl) Close() error {
 	return nil
 }
 
+func (wal *WALImpl) Close() error {
+	if err := wal.disk.Close(); err != nil {
+		return fmt.Errorf("failed to close underlying disk page manager: %w", err)
+	}
+
+	// Truncate the WAL on clean shutdown: all dirty pages were already flushed
+	// through WritePage (WAL-before-disk), so the records are no longer needed.
+	// This prevents the next open from scanning stale records unnecessarily.
+	if err := wal.file.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate WAL file on close: %w", err)
+	}
+
+	if err := wal.file.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL file: %w", err)
+	}
+
+	return nil
+}
+
 // Delete deletes the page manager and the underlying file.
 func (pm *PageManagerImpl) Delete() error {
 	if pm.file == nil {
@@ -379,6 +539,24 @@ func (bp *BufferPoolImpl) Delete() error {
 
 	if err := bp.disk.Delete(); err != nil {
 		return fmt.Errorf("failed to delete underlying disk page manager: %w", err)
+	}
+
+	return nil
+}
+
+func (wal *WALImpl) Delete() error {
+	// WAL does not manage page manager deletion directly, it delegates to the underlying disk page manager
+	if err := wal.disk.Delete(); err != nil {
+		return fmt.Errorf("failed to delete underlying disk page manager: %w", err)
+	}
+
+	// Delete the WAL file
+	path := wal.file.Name()
+	if err := wal.file.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL file: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("failed to delete WAL file: %w", err)
 	}
 
 	return nil
@@ -421,6 +599,51 @@ func NewBufferPool(disk PageManager, cacheSize int) PageManager {
 	}
 }
 
+// maxPageLSN scans every allocated page in disk and returns the highest LSN found.
+// This is called once at WAL open time so that new WAL records always have strictly
+// greater LSNs than any page already on disk, keeping recovery's LSN > page_LSN
+// comparison correct across sessions.
+func maxPageLSN(disk PageManager) (uint64, error) {
+	metaPage, err := disk.ReadPage(0)
+	if err != nil {
+		return 0, fmt.Errorf("reading meta page: %w", err)
+	}
+
+	var max uint64
+	for id := uint32(0); id < metaPage.GetMetaPageCount(); id++ {
+		p, err := disk.ReadPage(id)
+		if err != nil {
+			continue
+		}
+		if lsn := p.GetPageLSN(); lsn > max {
+			max = lsn
+		}
+	}
+	return max, nil
+}
+
+func NewWAL(disk PageManager, dbPath string) (*WALImpl, error) {
+	file, err := os.OpenFile(dbPath+"_WAL", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start the LSN one above the highest LSN already on disk. This guarantees
+	// WAL records from this session have strictly greater LSNs than any page,
+	// so recovery's "WAL_LSN > page_LSN" comparison is safe across sessions.
+	startLSN, err := maxPageLSN(disk)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to determine starting LSN: %w", err)
+	}
+
+	return &WALImpl{
+		disk:              disk,
+		file:              file,
+		logSequenceNumber: startLSN + 1,
+	}, nil
+}
+
 func OpenDB(path string) (PageManager, error) {
 	//open file
 	file, err := os.OpenFile(path, os.O_RDWR, 0644)
@@ -454,8 +677,12 @@ func OpenDB(path string) (PageManager, error) {
 		return nil, fmt.Errorf("invalid magic number: got %#x, want %#x", p.GetMetaPageMagicNumber(), MagicNumber)
 	}
 
-	return &PageManagerImpl{
-		file:     file,
-		metaPage: p,
-	}, nil
+	pm := &PageManagerImpl{file: file, metaPage: p}
+
+	if err := RecoverFromWAL(path+"_WAL", pm); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("WAL recovery failed: %w", err)
+	}
+
+	return pm, nil
 }
