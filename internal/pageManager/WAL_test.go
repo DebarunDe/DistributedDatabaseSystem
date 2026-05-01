@@ -1458,9 +1458,10 @@ func TestNewWAL_LSN_StartsAboveHighestOfManyPages(t *testing.T) {
 // ============================================================
 
 // Scenario:
-//  Session 1 — write page, close cleanly. Page on disk has LSN=N.
-//  Session 2 — reopen, write same page (WAL LSN > N), crash before disk write lands.
-//  Session 3 — reopen, RecoverFromWAL must replay the session-2 WAL record.
+//
+//	Session 1 — write page, close cleanly. Page on disk has LSN=N.
+//	Session 2 — reopen, write same page (WAL LSN > N), crash before disk write lands.
+//	Session 3 — reopen, RecoverFromWAL must replay the session-2 WAL record.
 //
 // Without the maxPageLSN fix, session 2's WAL LSN would restart at 0, which is
 // less than N, so recovery would skip the record and lose the write.
