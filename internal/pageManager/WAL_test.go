@@ -464,10 +464,6 @@ func TestWALImpl_WritePage_Record_HasCorrectPageData(t *testing.T) {
 	}
 
 	rec := readWALRecordAt(t, f, 0)
-	if got := rec.GetPageData()[CommonHeaderSize-WAL_OffsetPageData]; got != 0 {
-		// sentinel is at Data[CommonHeaderSize] in the page, which maps to
-		// GetPageData()[CommonHeaderSize] (GetPageData starts at offset 0 of the page copy).
-	}
 	if !bytes.Equal(rec.GetPageData(), p.Data[:]) {
 		t.Error("WAL record page data does not match the written page")
 	}
@@ -918,8 +914,12 @@ func TestNewWAL_LSNContinuesAcrossSessions(t *testing.T) {
 	if err := wal1.disk.Close(); err != nil {
 		t.Fatalf("session 1 disk close: %v", err)
 	}
-	wal1.file.Truncate(0)
-	wal1.file.Close()
+	if err := wal1.file.Truncate(0); err != nil {
+		t.Fatalf("truncate WAL file: %v", err)
+	}
+	if err := wal1.file.Close(); err != nil {
+		t.Fatalf("close WAL file: %v", err)
+	}
 
 	// Session 2: reopen and create a new WAL — must start above 3.
 	pm2Raw, err := OpenDB(dbPath)
@@ -1156,7 +1156,9 @@ func TestRecoverFromWAL_InvalidCRC_StopsReplay(t *testing.T) {
 	bad.SetLSN(2)
 	bad.SetPageID(p2.GetPageId())
 	bad.SetCRC32(0xDEADBEEF) // wrong
-	f.Write(bad.Data[:])
+	if _, err := f.Write(bad.Data[:]); err != nil {
+		t.Fatalf("write corrupt WAL record: %v", err)
+	}
 
 	// Record 2 would apply sentinel 0xBB to p2, but should never be reached.
 	// (We don't write it; the corrupt record stops iteration first.)
@@ -1187,7 +1189,9 @@ func TestRecoverFromWAL_PartialLastRecord_StopsGracefully(t *testing.T) {
 
 	// Write only half a WAL record's worth of bytes.
 	partial := make([]byte, WAL_RecordSize/2)
-	f.Write(partial)
+	if _, err := f.Write(partial); err != nil {
+		t.Fatalf("write partial WAL record: %v", err)
+	}
 	f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
