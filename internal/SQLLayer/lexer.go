@@ -65,16 +65,16 @@ func isDataType(word string) bool {
 }
 
 // map of SQL operators for quick lookup
-var operators = map[string]bool{
-	"=":   true,
-	"<":   true,
-	">":   true,
-	"<=":  true,
-	">=":  true,
-	"!=":  true,
-	"AND": true,
-	"OR":  true,
-}
+// var operators = map[string]bool{
+// 	"=":   true,
+// 	"<":   true,
+// 	">":   true,
+// 	"<=":  true,
+// 	">=":  true,
+// 	"!=":  true,
+// 	"AND": true,
+// 	"OR":  true,
+// }
 
 // tokenize takes an input SQL query and returns a slice of tokens
 func Tokenize(query string) ([]Token, error) {
