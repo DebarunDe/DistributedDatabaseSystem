@@ -349,7 +349,7 @@ func newWALImplForTest(t *testing.T, disk PageManager) (*WALImpl, *os.File) {
 	if err != nil {
 		t.Fatalf("os.CreateTemp: %v", err)
 	}
-	t.Cleanup(func() { f.Close() })
+	t.Cleanup(func() { _ = f.Close() })
 	return &WALImpl{disk: disk, file: f, logSequenceNumber: 0}, f
 }
 
@@ -812,7 +812,7 @@ func TestWALImpl_Delete_DiskError_WALFileRetained(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Create: %v", err)
 	}
-	t.Cleanup(func() { f.Close(); os.Remove(walPath) })
+	t.Cleanup(func() { _ = f.Close(); _ = os.Remove(walPath) })
 	wal := &WALImpl{disk: spy, file: f, logSequenceNumber: 0}
 
 	if err := wal.Delete(); err == nil {
@@ -836,7 +836,7 @@ func TestNewWAL_CreatesWALFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWAL: %v", err)
 	}
-	defer wal.file.Close()
+	defer func() { _ = wal.file.Close() }()
 
 	if _, err := os.Stat(walPath); err != nil {
 		t.Errorf("WAL file not created: %v", err)
@@ -861,7 +861,7 @@ func TestNewWAL_OpensExistingWALFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second NewWAL on existing file: %v", err)
 	}
-	defer wal2.file.Close()
+	defer func() { _ = wal2.file.Close() }()
 }
 
 // On a fresh DB every page has LSN 0, so NewWAL must start at LSN 1 (maxPageLSN+1).
@@ -874,7 +874,7 @@ func TestNewWAL_LSNStartsAboveMaxPageLSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWAL: %v", err)
 	}
-	defer wal.file.Close()
+	defer func() { _ = wal.file.Close() }()
 
 	// Fresh DB: meta page LSN = 0, so expected starting LSN = 0 + 1 = 1.
 	if wal.logSequenceNumber != 1 {
@@ -926,13 +926,13 @@ func TestNewWAL_LSNContinuesAcrossSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
-	t.Cleanup(func() { pm2Raw.Close() })
+	t.Cleanup(func() { _ = pm2Raw.Close() })
 
 	wal2, err := NewWAL(pm2Raw, dbPath)
 	if err != nil {
 		t.Fatalf("session 2 NewWAL: %v", err)
 	}
-	defer wal2.file.Close()
+	defer func() { _ = wal2.file.Close() }()
 
 	if wal2.logSequenceNumber <= 3 {
 		t.Errorf("session 2 logSequenceNumber = %d, want > 3 (highest LSN from session 1)",
@@ -968,7 +968,7 @@ func TestRecoverFromWAL_EmptyWALFile_Succeeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating WAL file: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL on empty file: %v", err)
@@ -1006,7 +1006,7 @@ func TestRecoverFromWAL_WALLSNGreaterThanPageLSN_PageReplayed(t *testing.T) {
 		t.Fatalf("creating WAL file: %v", err)
 	}
 	appendWALRecord(t, f, 5, pageID, walPage)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1045,7 +1045,7 @@ func TestRecoverFromWAL_WALLSNEqualPageLSN_PageNotReplayed(t *testing.T) {
 	walPath := path + "_WAL"
 	f, _ := os.Create(walPath)
 	appendWALRecord(t, f, 3, pageID, walPage)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1083,7 +1083,7 @@ func TestRecoverFromWAL_WALLSNLessThanPageLSN_PageNotReplayed(t *testing.T) {
 	walPath := path + "_WAL"
 	f, _ := os.Create(walPath)
 	appendWALRecord(t, f, 3, pageID, walPage)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1119,7 +1119,7 @@ func TestRecoverFromWAL_MultipleRecords_AllProcessed(t *testing.T) {
 		walPage.Data[CommonHeaderSize] = sentinels[i]
 		appendWALRecord(t, f, uint64(i+1), p.GetPageId(), walPage)
 	}
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1162,7 +1162,7 @@ func TestRecoverFromWAL_InvalidCRC_StopsReplay(t *testing.T) {
 
 	// Record 2 would apply sentinel 0xBB to p2, but should never be reached.
 	// (We don't write it; the corrupt record stops iteration first.)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1192,7 +1192,7 @@ func TestRecoverFromWAL_PartialLastRecord_StopsGracefully(t *testing.T) {
 	if _, err := f.Write(partial); err != nil {
 		t.Fatalf("write partial WAL record: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Errorf("RecoverFromWAL with partial record: %v", err)
@@ -1211,7 +1211,7 @@ func TestRecoverFromWAL_TruncatesWALAfterRecovery(t *testing.T) {
 	walPath := path + "_WAL"
 	f, _ := os.Create(walPath)
 	appendWALRecord(t, f, 1, dataPage.GetPageId(), walPage)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1241,7 +1241,7 @@ func TestRecoverFromWAL_MetaPageRefreshed(t *testing.T) {
 	f, _ := os.Create(walPath)
 	// Meta page is always page 0, WAL LSN=1 > page 0 LSN=0.
 	appendWALRecord(t, f, 1, 0, metaPage)
-	f.Close()
+	_ = f.Close()
 
 	if err := RecoverFromWAL(walPath, pm); err != nil {
 		t.Fatalf("RecoverFromWAL: %v", err)
@@ -1292,9 +1292,9 @@ func TestRecoverFromWAL_EndToEnd_CrashRecovery(t *testing.T) {
 	writePageDirect(t, pm1, corrupted)
 
 	// Close file handles without going through proper shutdown (simulating crash).
-	pm1.file.Close()
+	_ = pm1.file.Close()
 	pm1.file = nil
-	wal1.file.Close()
+	_ = wal1.file.Close()
 
 	// ── Session 2: open DB and run recovery ─────────────────────────────────
 	// Because the on-disk page has LSN=0 and the WAL record also has LSN=0,
@@ -1332,7 +1332,7 @@ func TestRecoverFromWAL_EndToEnd_StalePageRestored(t *testing.T) {
 		t.Fatalf("AllocatePage: %v", err)
 	}
 	pageID := dataPage.GetPageId()
-	pm1.file.Close()
+	_ = pm1.file.Close()
 	pm1.file = nil
 
 	// Craft a WAL record with LSN=1 (> 0) carrying the "intended" page data.
@@ -1343,7 +1343,7 @@ func TestRecoverFromWAL_EndToEnd_StalePageRestored(t *testing.T) {
 	wantPage.setPageLSN(1)
 	wantPage.Data[CommonHeaderSize] = 0x7F
 	appendWALRecord(t, f, 1, pageID, wantPage)
-	f.Close()
+	_ = f.Close()
 
 	pm2 := openDBForWALTest(t, dbPath)
 	if err := RecoverFromWAL(walPath, pm2); err != nil {
@@ -1443,13 +1443,13 @@ func TestNewWAL_LSN_StartsAboveHighestOfManyPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
-	t.Cleanup(func() { pm2Raw.Close() })
+	t.Cleanup(func() { _ = pm2Raw.Close() })
 
 	wal2, err := NewWAL(pm2Raw, dbPath)
 	if err != nil {
 		t.Fatalf("session 2 NewWAL: %v", err)
 	}
-	defer wal2.file.Close()
+	defer func() { _ = wal2.file.Close() }()
 
 	if wal2.logSequenceNumber <= lastLSN {
 		t.Errorf("session 2 logSequenceNumber = %d, want > %d (highest page LSN)",
@@ -1538,9 +1538,9 @@ func TestRecoverFromWAL_CrossSession_CrashInSession2_RestoredInSession3(t *testi
 	writePageDirect(t, pm2, stale)
 
 	// Close file handles directly (simulating process death; WAL not truncated).
-	pm2.file.Close()
+	_ = pm2.file.Close()
 	pm2.file = nil
-	wal2.file.Close()
+	_ = wal2.file.Close()
 
 	// ── Session 3: open and recover ──────────────────────────────────────────
 	pm3 := openDBForWALTest(t, dbPath)

@@ -82,7 +82,7 @@ func RecoverFromWAL(walPath string, pm *PageManagerImpl) error {
 	if err != nil {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
-	defer walFile.Close()
+	defer func() { _ = walFile.Close() }()
 
 	record := &WAL{}
 	for {
@@ -573,14 +573,14 @@ func NewDB(path string) (PageManager, error) {
 	p := NewMetaPage()
 
 	if _, err = file.WriteAt(p.Data[:], 0); err != nil {
-		file.Close()
-		os.Remove(path)
+		_ = file.Close()
+		_ = os.Remove(path)
 		return nil, err
 	}
 
 	if err = file.Sync(); err != nil {
-		file.Close()
-		os.Remove(path)
+		_ = file.Close()
+		_ = os.Remove(path)
 		return nil, err
 	}
 
@@ -633,7 +633,7 @@ func NewWAL(disk PageManager, dbPath string) (*WALImpl, error) {
 	// so recovery's "WAL_LSN > page_LSN" comparison is safe across sessions.
 	startLSN, err := maxPageLSN(disk)
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("failed to determine starting LSN: %w", err)
 	}
 
@@ -654,12 +654,12 @@ func OpenDB(path string) (PageManager, error) {
 	//check file size
 	info, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, err
 	}
 
 	if info.Size() < PageSize {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("file too small: %d bytes, need at least %d", info.Size(), PageSize)
 	}
 
@@ -667,20 +667,20 @@ func OpenDB(path string) (PageManager, error) {
 	p := &Page{}
 	_, err = file.ReadAt(p.Data[:], 0)
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, err
 	}
 
 	//validate magic number
 	if p.GetMetaPageMagicNumber() != MagicNumber {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("invalid magic number: got %#x, want %#x", p.GetMetaPageMagicNumber(), MagicNumber)
 	}
 
 	pm := &PageManagerImpl{file: file, metaPage: p}
 
 	if err := RecoverFromWAL(path+"_WAL", pm); err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("WAL recovery failed: %w", err)
 	}
 
