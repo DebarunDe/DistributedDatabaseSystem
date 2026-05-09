@@ -17,6 +17,7 @@ const (
 	TOKEN_LPAREN                      // Left parenthesis (
 	TOKEN_RPAREN                      // Right parenthesis
 	TOKEN_DATATYPE                    // Data types like INT, VARCHAR, etc.
+	TOKEN_STAR                        // Wildcard *
 )
 
 type Token struct {
@@ -150,6 +151,9 @@ func Tokenize(query string) ([]Token, error) {
 			} else {
 				tokens = append(tokens, CreateToken(TOKEN_OPERATOR, "<"))
 			}
+
+		case ch == '*':
+			tokens = append(tokens, CreateToken(TOKEN_STAR, "*"))
 
 		case ch == ',':
 			tokens = append(tokens, CreateToken(TOKEN_COMMA, ","))
