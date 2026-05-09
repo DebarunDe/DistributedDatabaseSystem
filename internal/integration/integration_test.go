@@ -32,7 +32,7 @@ func newTestDB(t *testing.T) *testDB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.db")
 	db := createAt(t, path)
-	t.Cleanup(func() { os.Remove(path); os.Remove(path + "_WAL") })
+	t.Cleanup(func() { _ = os.Remove(path); _ = os.Remove(path + "_WAL") })
 	return db
 }
 

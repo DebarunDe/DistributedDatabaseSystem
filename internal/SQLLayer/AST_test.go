@@ -446,77 +446,77 @@ func TestParseEmptyInput(t *testing.T) {
 }
 
 func TestParseUnknownKeyword(t *testing.T) {
-	parseSQLError(t, "FOOBAR id FROM t")
+	_ = parseSQLError(t, "FOOBAR id FROM t")
 }
 
 func TestParseSelectMissingFrom(t *testing.T) {
-	parseSQLError(t, "SELECT id users")
+	_ = parseSQLError(t, "SELECT id users")
 }
 
 func TestParseSelectMissingTable(t *testing.T) {
-	parseSQLError(t, "SELECT id FROM")
+	_ = parseSQLError(t, "SELECT id FROM")
 }
 
 func TestParseSelectMissingColumn(t *testing.T) {
-	parseSQLError(t, "SELECT FROM users")
+	_ = parseSQLError(t, "SELECT FROM users")
 }
 
 func TestParseSelectWhereMissingValue(t *testing.T) {
-	parseSQLError(t, "SELECT id FROM t WHERE age =")
+	_ = parseSQLError(t, "SELECT id FROM t WHERE age =")
 }
 
 func TestParseSelectWhereMissingOperator(t *testing.T) {
-	parseSQLError(t, "SELECT id FROM t WHERE age 30")
+	_ = parseSQLError(t, "SELECT id FROM t WHERE age 30")
 }
 
 func TestParseInsertMissingInto(t *testing.T) {
-	parseSQLError(t, "INSERT users VALUES (1)")
+	_ = parseSQLError(t, "INSERT users VALUES (1)")
 }
 
 func TestParseInsertMissingValues(t *testing.T) {
-	parseSQLError(t, "INSERT INTO users (1)")
+	_ = parseSQLError(t, "INSERT INTO users (1)")
 }
 
 func TestParseInsertMissingParen(t *testing.T) {
-	parseSQLError(t, "INSERT INTO users VALUES 1")
+	_ = parseSQLError(t, "INSERT INTO users VALUES 1")
 }
 
 func TestParseInsertMissingTable(t *testing.T) {
-	parseSQLError(t, "INSERT INTO VALUES (1)")
+	_ = parseSQLError(t, "INSERT INTO VALUES (1)")
 }
 
 func TestParseUpdateMissingSet(t *testing.T) {
-	parseSQLError(t, "UPDATE users name = 'x'")
+	_ = parseSQLError(t, "UPDATE users name = 'x'")
 }
 
 func TestParseUpdateMissingTable(t *testing.T) {
-	parseSQLError(t, "UPDATE SET name = 'x'")
+	_ = parseSQLError(t, "UPDATE SET name = 'x'")
 }
 
 func TestParseUpdateMissingValue(t *testing.T) {
-	parseSQLError(t, "UPDATE users SET name =")
+	_ = parseSQLError(t, "UPDATE users SET name =")
 }
 
 func TestParseDeleteMissingFrom(t *testing.T) {
-	parseSQLError(t, "DELETE users")
+	_ = parseSQLError(t, "DELETE users")
 }
 
 func TestParseDeleteMissingTable(t *testing.T) {
-	parseSQLError(t, "DELETE FROM")
+	_ = parseSQLError(t, "DELETE FROM")
 }
 
 func TestParseCreateMissingTable(t *testing.T) {
-	parseSQLError(t, "CREATE users (id INT)")
+	_ = parseSQLError(t, "CREATE users (id INT)")
 }
 
 func TestParseCreateMissingColumns(t *testing.T) {
-	parseSQLError(t, "CREATE TABLE users")
+	_ = parseSQLError(t, "CREATE TABLE users")
 }
 
 func TestParseDropMissingTable(t *testing.T) {
-	parseSQLError(t, "DROP users")
+	_ = parseSQLError(t, "DROP users")
 }
 
 func TestParseDropMissingName(t *testing.T) {
-	parseSQLError(t, "DROP TABLE")
+	_ = parseSQLError(t, "DROP TABLE")
 }

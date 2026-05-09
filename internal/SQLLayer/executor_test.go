@@ -15,16 +15,6 @@ func newTestExecutor(t *testing.T) *Executor {
 	return NewExecutor(sc, bt)
 }
 
-// mustExec runs Execute and fails the test on error.
-func mustExec(t *testing.T, ex *Executor, stmt Statement) *ResultSet {
-	t.Helper()
-	rs, err := ex.Execute(stmt)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	return rs
-}
-
 // mustExecSQL tokenizes, parses, and executes a SQL string, failing on any error.
 func mustExecSQL(t *testing.T, ex *Executor, query string) *ResultSet {
 	t.Helper()

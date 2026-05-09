@@ -29,7 +29,7 @@ func openOrCreate(path string) (pagemanager.PageManager, error) {
 	}
 	wal, err := pagemanager.NewWAL(disk, path)
 	if err != nil {
-		disk.Close()
+		_ = disk.Close()
 		return nil, err
 	}
 	return pagemanager.NewBufferPool(wal, defaultCacheSize), nil
@@ -75,7 +75,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
 		os.Exit(1)
 	}
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	bt := btree.NewBTree(pm)
 	sc := sqllayer.NewSchemaCatalog(bt)

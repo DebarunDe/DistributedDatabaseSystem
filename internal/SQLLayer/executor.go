@@ -50,7 +50,7 @@ func literalToField(lit Literal, dataType string, tag uint8) (btree.Field, error
 	if dataType == "INT" {
 		n, err := strconv.ParseInt(lit.Value, 10, 64)
 		if err != nil {
-			return btree.Field{}, fmt.Errorf("Failed to parse INT literal: %v", err)
+			return btree.Field{}, fmt.Errorf("failed to parse INT literal: %v", err)
 		}
 
 		return btree.Field{
@@ -74,7 +74,7 @@ func literalToField(lit Literal, dataType string, tag uint8) (btree.Field, error
 	}
 
 	//non matching type
-	return btree.Field{}, fmt.Errorf("Incompatible field: %q", dataType)
+	return btree.Field{}, fmt.Errorf("incompatible field: %q", dataType)
 }
 
 // literalToPrimaryKey converts literal value into primary key
@@ -385,7 +385,7 @@ func (ex *Executor) executeCreate(s *CreateTableStatement) (*ResultSet, error) {
 	}
 
 	if err := ex.sc.CreateTable(s.Table, pkName, pkType, columnNames, columnTypes); err != nil {
-		return nil, fmt.Errorf("Create table %q: %w", s.Table, err)
+		return nil, fmt.Errorf("create table %q: %w", s.Table, err)
 	}
 
 	return nil, nil
@@ -394,7 +394,7 @@ func (ex *Executor) executeCreate(s *CreateTableStatement) (*ResultSet, error) {
 // executeDrop executes a drop statement
 func (ex *Executor) executeDrop(s *DropTableStatement) (*ResultSet, error) {
 	if err := ex.sc.DropTable(s.Table); err != nil {
-		return nil, fmt.Errorf("Drop table %q: %w", s.Table, err)
+		return nil, fmt.Errorf("drop table %q: %w", s.Table, err)
 	}
 
 	return nil, nil

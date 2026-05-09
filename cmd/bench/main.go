@@ -60,7 +60,7 @@ func newTempDB(backendType string) (pagemanager.PageManager, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	cleanup := func() { os.RemoveAll(dir) }
+	cleanup := func() { _ = os.RemoveAll(dir) }
 
 	path := filepath.Join(dir, "bench.db")
 	var pm pagemanager.PageManager
@@ -104,7 +104,7 @@ func benchWrite(backendType string, ops int, rng *rand.Rand) (result, error) {
 		return result{}, err
 	}
 	defer cleanup()
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	tree := btree.NewBTree(pm)
 	field := sampleField()
@@ -129,7 +129,7 @@ func benchRead(backendType string, ops int, rng *rand.Rand) (result, error) {
 		return result{}, err
 	}
 	defer cleanup()
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	tree := btree.NewBTree(pm)
 	field := sampleField()
@@ -165,7 +165,7 @@ func benchRangeScan(backendType string, ops int, rng *rand.Rand) (result, error)
 		return result{}, err
 	}
 	defer cleanup()
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	tree := btree.NewBTree(pm)
 	field := sampleField()

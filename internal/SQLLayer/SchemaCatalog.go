@@ -155,7 +155,7 @@ func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, pr
 	//Insert first, if failed we return without polluting cache
 	err := sc.bt.Insert(key, fields)
 	if err != nil {
-		return fmt.Errorf("Error inserting table into BTree: %w", err)
+		return fmt.Errorf("error inserting table into BTree: %w", err)
 	}
 
 	sc.maxTableId = newTableId

@@ -86,7 +86,7 @@ func TestNewDB_Close_MagicNumber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open file: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var buf [PageSize]byte
 	if _, err := f.ReadAt(buf[:], 0); err != nil {
@@ -116,7 +116,7 @@ func TestNewDB_ErrorIfFileExists(t *testing.T) {
 func TestNewDB_InitialMetaState(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	meta := metaOf(t, pm)
 
@@ -155,7 +155,7 @@ func TestOpenDB_MetaStateMatchesNewDB(t *testing.T) {
 	mustClose(t, pm)
 
 	pm2 := mustOpenDB(t, path)
-	defer pm2.Close()
+	defer func() { _ = pm2.Close() }()
 
 	meta := metaOf(t, pm2)
 
@@ -222,7 +222,7 @@ func TestOpenDB_FileTooSmall(t *testing.T) {
 func TestAllocatePage_FirstPageID(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	page, err := pm.AllocatePage()
 	if err != nil {
@@ -237,7 +237,7 @@ func TestAllocatePage_FirstPageID(t *testing.T) {
 func TestAllocatePage_ReadBack(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	allocated := mustAllocate(t, pm)
 	id := allocated.GetPageId()
@@ -255,7 +255,7 @@ func TestAllocatePage_ReadBack(t *testing.T) {
 func TestAllocatePage_SequentialIDs(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	for want := uint32(1); want <= 5; want++ {
 		page, err := pm.AllocatePage()
@@ -272,7 +272,7 @@ func TestAllocatePage_SequentialIDs(t *testing.T) {
 func TestAllocatePage_MetaPageCountIncrements(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	meta := metaOf(t, pm)
 	if got := meta.GetMetaPageCount(); got != 1 {
@@ -293,7 +293,7 @@ func TestAllocatePage_MetaPageCountIncrements(t *testing.T) {
 func TestReadPage_OutOfBounds(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	// Only page 0 exists; page 1 is out of bounds.
 	_, err := pm.ReadPage(1)
@@ -306,7 +306,7 @@ func TestReadPage_OutOfBounds(t *testing.T) {
 func TestReadPage_MetaPage(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	page, err := pm.ReadPage(0)
 	if err != nil {
@@ -348,7 +348,7 @@ func TestWritePage_Persistence(t *testing.T) {
 	mustClose(t, pm)
 
 	pm2 := mustOpenDB(t, path)
-	defer pm2.Close()
+	defer func() { _ = pm2.Close() }()
 
 	readBack, err := pm2.ReadPage(pageID)
 	if err != nil {
@@ -394,7 +394,7 @@ func TestWritePage_Persistence_WithRecord(t *testing.T) {
 	mustClose(t, pm)
 
 	pm2 := mustOpenDB(t, path)
-	defer pm2.Close()
+	defer func() { _ = pm2.Close() }()
 
 	readBack, err := pm2.ReadPage(pageID)
 	if err != nil {
@@ -413,7 +413,7 @@ func TestWritePage_Persistence_WithRecord(t *testing.T) {
 func TestWritePage_OutOfBounds(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	bad := &Page{}
 	bad.setPageId(999)
@@ -432,7 +432,7 @@ func TestWritePage_OutOfBounds(t *testing.T) {
 func TestFreePage_FreeListHead(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	p2 := mustAllocate(t, pm)
@@ -453,7 +453,7 @@ func TestFreePage_FreeListHead(t *testing.T) {
 func TestFreePage_ReuseFreedPage(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	p2 := mustAllocate(t, pm)
@@ -479,7 +479,7 @@ func TestFreePage_ReuseFreedPage(t *testing.T) {
 func TestFreePage_FreeListEmptyAfterReuse(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	_ = p1
@@ -502,7 +502,7 @@ func TestFreePage_FreeListEmptyAfterReuse(t *testing.T) {
 func TestFreePage_MultipleFreedPagesChained(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	p2 := mustAllocate(t, pm)
@@ -538,7 +538,7 @@ func TestFreePage_MultipleFreedPagesChained(t *testing.T) {
 func TestFreePage_ErrorOnPage0(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if err := pm.FreePage(0); err == nil {
 		t.Error("FreePage(0) should return error (cannot free meta page)")
@@ -549,7 +549,7 @@ func TestFreePage_ErrorOnPage0(t *testing.T) {
 func TestFreePage_ErrorOnOutOfBounds(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if err := pm.FreePage(999); err == nil {
 		t.Error("FreePage with out-of-bounds ID should return error")
@@ -560,7 +560,7 @@ func TestFreePage_ErrorOnOutOfBounds(t *testing.T) {
 func TestFreePage_NextPointerChain(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	p2 := mustAllocate(t, pm)
@@ -591,7 +591,7 @@ func TestFreePage_NextPointerChain(t *testing.T) {
 func TestGetRootPageID_InitialValue(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if got := pm.GetRootPageId(); got != InvalidPageID {
 		t.Errorf("initial GetRootPageId() = %#x, want InvalidPageID", got)
@@ -602,7 +602,7 @@ func TestGetRootPageID_InitialValue(t *testing.T) {
 func TestSetRootPageID_InMemory(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if err := pm.SetRootPageId(42); err != nil {
 		t.Fatalf("SetRootPageId(42): %v", err)
@@ -626,7 +626,7 @@ func TestSetRootPageID_Persistence(t *testing.T) {
 	mustClose(t, pm)
 
 	pm2 := mustOpenDB(t, path)
-	defer pm2.Close()
+	defer func() { _ = pm2.Close() }()
 
 	if got := pm2.GetRootPageId(); got != 77 {
 		t.Errorf("GetRootPageId() after reopen = %d, want 77", got)
@@ -637,7 +637,7 @@ func TestSetRootPageID_Persistence(t *testing.T) {
 func TestSetRootPageID_OverwritesPrevious(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	for _, id := range []uint32{1, 5, 99, InvalidPageID} {
 		if err := pm.SetRootPageId(id); err != nil {
@@ -683,7 +683,7 @@ func TestDelete_AllowsRecreation(t *testing.T) {
 	if err != nil {
 		t.Errorf("NewDB after Delete should succeed: %v", err)
 	} else {
-		pm2.Close()
+		_ = pm2.Close()
 	}
 }
 
@@ -749,14 +749,14 @@ func TestEdgeCase_DoubleClose(t *testing.T) {
 			t.Errorf("second Close panicked: %v", r)
 		}
 	}()
-	pm.Close() // second close: must not crash
+	_ = pm.Close() // second close: must not crash
 }
 
 // FreePage(0) — the meta page — must always return an error.
 func TestEdgeCase_FreeMetaPage(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if err := pm.FreePage(0); err == nil {
 		t.Error("FreePage(0) should return error")
@@ -767,7 +767,7 @@ func TestEdgeCase_FreeMetaPage(t *testing.T) {
 func TestEdgeCase_WritePageBeyondCount(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	bad := &Page{}
 	bad.setPageId(uint32(^uint32(0) - 1)) // near-max ID
@@ -780,7 +780,7 @@ func TestEdgeCase_WritePageBeyondCount(t *testing.T) {
 func TestEdgeCase_ReadPageBeyondCount(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	if _, err := pm.ReadPage(100); err == nil {
 		t.Error("ReadPage beyond page count should return error")
@@ -804,7 +804,7 @@ func TestEdgeCase_NewDBOnExistingPath(t *testing.T) {
 func TestAllocatePage_NoDuplicateIDs(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	seen := make(map[uint32]bool)
 	for i := 0; i < 20; i++ {
@@ -824,7 +824,7 @@ func TestAllocatePage_NoDuplicateIDs(t *testing.T) {
 func TestFreePage_ReuseDoesNotInflatePageCount(t *testing.T) {
 	path := newTempPath(t)
 	pm := mustNewDB(t, path)
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	p1 := mustAllocate(t, pm)
 	_ = p1
@@ -864,7 +864,7 @@ func TestMetaState_PersistsAcrossRestart(t *testing.T) {
 	mustClose(t, pm)
 
 	pm2 := mustOpenDB(t, path)
-	defer pm2.Close()
+	defer func() { _ = pm2.Close() }()
 
 	if got := metaOf(t, pm2).GetMetaPageCount(); got != wantCount {
 		t.Errorf("page count after reopen = %d, want %d", got, wantCount)
