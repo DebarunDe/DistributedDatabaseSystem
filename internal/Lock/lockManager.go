@@ -1,10 +1,47 @@
 package lock
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 )
 
+// Deadlock Detector
+type WaitForGraph = map[uint64][]uint64 //txnId → list of txnIds it waits for
+
+func buildWaitForGraph(rowLocks map[uint64]*RowLock) WaitForGraph {
+	graph := make(map[uint64][]uint64)
+
+	for rowKey := range rowLocks {
+		for _, waiter := range rowLocks[rowKey].waitQueue {
+			graph[waiter.txnId] = append(graph[waiter.txnId], rowLocks[rowKey].holders...)
+		}
+	}
+
+	return graph
+}
+
+func detectCycle(graph WaitForGraph, startTxnId uint64) bool {
+	visited := make(map[uint64]bool)
+
+	return dfs(graph, startTxnId, visited)
+}
+
+func dfs(graph WaitForGraph, txnId uint64, visited map[uint64]bool) bool {
+	visited[txnId] = true
+	for _, nei := range graph[txnId] {
+		if visited[nei] {
+			return true
+		}
+		if dfs(graph, nei, visited) {
+			return true
+		}
+	}
+	visited[txnId] = false
+	return false
+}
+
+// Lock Manager
 type LockType int
 
 const (
@@ -81,6 +118,15 @@ func (lm *LockManager) Lock(txnId uint64, rowKey uint64, lockType LockType) erro
 			wake:     make(chan struct{}, 1),
 		}
 		row.waitQueue = append(row.waitQueue, *wr)
+
+		//determine if deadlock occurs
+		graph := buildWaitForGraph(lm.rowLocks)
+		if detectCycle(graph, wr.txnId) {
+			row.waitQueue = slices.Delete(row.waitQueue, len(row.waitQueue)-1, len(row.waitQueue))
+			lm.mu.Unlock()
+			return fmt.Errorf("deadlock detected, rejecting wait request for txn: %d", wr.txnId)
+		}
+
 		lm.mu.Unlock()
 		<-wr.wake
 		lm.mu.Lock()
