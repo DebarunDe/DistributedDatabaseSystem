@@ -2,7 +2,9 @@ package sqllayer
 
 import (
 	"testing"
+	"time"
 
+	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 )
 
@@ -12,7 +14,8 @@ func newTestExecutor(t *testing.T) *Executor {
 	t.Helper()
 	bt := newTestBTree(t)
 	sc := NewSchemaCatalog(bt)
-	return NewExecutor(sc, bt)
+	tm := lock.NewTransactionManager(bt)
+	return NewExecutor(sc, bt, tm)
 }
 
 // mustExecSQL tokenizes, parses, and executes a SQL string, failing on any error.
@@ -35,7 +38,14 @@ func execSQL(ex *Executor, query string) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ex.Execute(stmt)
+	txn := ex.tm.Begin()
+	rs, err := ex.Execute(stmt, txn.Id)
+	if err != nil {
+		ex.tm.Rollback(txn.Id)
+		return nil, err
+	}
+	ex.tm.Commit(txn.Id)
+	return rs, nil
 }
 
 // assertRowCount checks that a ResultSet has exactly n rows.
@@ -1018,7 +1028,8 @@ func (s *unknownStmt) isStatement() {}
 
 func TestExecute_UnknownStatementType(t *testing.T) {
 	ex := newTestExecutor(t)
-	_, err := ex.Execute(&unknownStmt{})
+	txn := ex.tm.Begin()
+	_, err := ex.Execute(&unknownStmt{}, txn.Id)
 	if err == nil {
 		t.Error("expected error for unknown statement type")
 	}
@@ -1125,4 +1136,335 @@ func TestIntegration_UpdateThenSelectBool(t *testing.T) {
 	if fieldStrVal(t, rs.Rows[0].Fields[0], "active") != "TRUE" {
 		t.Errorf("expected TRUE")
 	}
+}
+
+// ---- helpers for manual transaction control ----
+
+// execInTxn parses and executes a SQL string inside the given transaction without
+// committing or rolling back. The caller owns the transaction lifecycle.
+func execInTxn(ex *Executor, txnId uint64, query string) (*ResultSet, error) {
+	tokens, err := Tokenize(query)
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := Parse(tokens)
+	if err != nil {
+		return nil, err
+	}
+	return ex.Execute(stmt, txnId)
+}
+
+func mustExecInTxn(t *testing.T, ex *Executor, txnId uint64, query string) *ResultSet {
+	t.Helper()
+	rs, err := execInTxn(ex, txnId, query)
+	if err != nil {
+		t.Fatalf("execInTxn(%q): %v", query, err)
+	}
+	return rs
+}
+
+// ---- Undo log correctness ----
+
+func TestUndoLog_InsertRecordsUndoInsertOp(t *testing.T) {
+	ex := setupUsersTable(t)
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	if len(txn.UndoLog) != 1 {
+		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
+	}
+	if txn.UndoLog[0].Op != lock.UndoInsert {
+		t.Errorf("Op: got %v, want UndoInsert", txn.UndoLog[0].Op)
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_InsertHasNilFields(t *testing.T) {
+	ex := setupUsersTable(t)
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	if txn.UndoLog[0].Fields != nil {
+		t.Error("UndoInsert entry should have nil Fields")
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_DeleteRecordsUndoDeleteWithSavedFields(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "DELETE FROM users WHERE id = 1")
+
+	if len(txn.UndoLog) != 1 {
+		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
+	}
+	e := txn.UndoLog[0]
+	if e.Op != lock.UndoDelete {
+		t.Errorf("Op: got %v, want UndoDelete", e.Op)
+	}
+	if e.Fields == nil {
+		t.Error("UndoDelete entry must save old Fields")
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_UpdateRecordsUndoUpdateWithSavedFields(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 1")
+
+	if len(txn.UndoLog) != 1 {
+		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
+	}
+	e := txn.UndoLog[0]
+	if e.Op != lock.UndoUpdate {
+		t.Errorf("Op: got %v, want UndoUpdate", e.Op)
+	}
+	if e.Fields == nil {
+		t.Error("UndoUpdate entry must save old Fields")
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_UpdateSavesPreUpdateFieldValue(t *testing.T) {
+	// The saved fields must hold the value *before* the update (30, not 99).
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 1")
+
+	// fields layout: [id(tag0), name(tag1), age(tag2)]
+	oldAge := fieldIntVal(t, txn.UndoLog[0].Fields[2], "old_age")
+	if oldAge != 30 {
+		t.Errorf("saved age: got %d, want 30 (pre-update value)", oldAge)
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_SelectDoesNotRecord(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "SELECT * FROM users")
+
+	if len(txn.UndoLog) != 0 {
+		t.Errorf("SELECT should produce no undo entries, got %d", len(txn.UndoLog))
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_MultipleInsertsAccumulate(t *testing.T) {
+	ex := setupUsersTable(t)
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (2, 'bob', 25)")
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (3, 'carol', 35)")
+
+	if len(txn.UndoLog) != 3 {
+		t.Fatalf("UndoLog len: got %d, want 3", len(txn.UndoLog))
+	}
+	for i, e := range txn.UndoLog {
+		if e.Op != lock.UndoInsert {
+			t.Errorf("entry[%d]: Op = %v, want UndoInsert", i, e.Op)
+		}
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+func TestUndoLog_UpdateNoWhereRecordsOneEntryPerRow(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99")
+
+	if len(txn.UndoLog) != 2 {
+		t.Errorf("UndoLog len: got %d, want 2 (one per matched row)", len(txn.UndoLog))
+	}
+	for i, e := range txn.UndoLog {
+		if e.Op != lock.UndoUpdate {
+			t.Errorf("entry[%d]: Op = %v, want UndoUpdate", i, e.Op)
+		}
+	}
+	ex.tm.Commit(txn.Id)
+}
+
+// ---- Rollback correctness ----
+
+func TestRollback_InsertIsReverted(t *testing.T) {
+	ex := setupUsersTable(t)
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 0)
+}
+
+func TestRollback_DeleteIsReverted(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "DELETE FROM users WHERE id = 1")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 1)
+	if fieldStrVal(t, rs.Rows[0].Fields[1], "name") != "alice" {
+		t.Error("deleted row should be restored after rollback")
+	}
+	if fieldIntVal(t, rs.Rows[0].Fields[2], "age") != 30 {
+		t.Errorf("restored row should have original age=30")
+	}
+}
+
+func TestRollback_UpdateIsReverted(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 1")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT age FROM users WHERE id = 1")
+	assertRowCount(t, rs, 1)
+	if fieldIntVal(t, rs.Rows[0].Fields[0], "age") != 30 {
+		t.Errorf("age: got %v after rollback, want 30", rs.Rows[0].Fields[0].Value)
+	}
+}
+
+func TestRollback_MultipleInsertsAllReverted(t *testing.T) {
+	ex := setupUsersTable(t)
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (2, 'bob', 25)")
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (3, 'carol', 35)")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 0)
+}
+
+func TestRollback_MultipleDeletesAllReverted(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "DELETE FROM users")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 2)
+}
+
+func TestRollback_CommittedRowUnaffected(t *testing.T) {
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (2, 'bob', 25)")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 1)
+	if fieldStrVal(t, rs.Rows[0].Fields[1], "name") != "alice" {
+		t.Error("committed row should survive rollback of other transaction")
+	}
+}
+
+func TestRollback_MixedOpsReverted(t *testing.T) {
+	// Commit rows 1 and 2. In one txn: delete row 1, update row 2's age, insert row 3.
+	// After rollback: rows 1 and 2 restored to originals, row 3 absent.
+	ex := setupUsersTable(t)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")
+
+	txn := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn.Id, "DELETE FROM users WHERE id = 1")
+	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 2")
+	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (3, 'carol', 35)")
+	ex.tm.Rollback(txn.Id)
+
+	rs := mustExecSQL(t, ex, "SELECT * FROM users")
+	assertRowCount(t, rs, 2)
+
+	rs = mustExecSQL(t, ex, "SELECT age FROM users WHERE id = 2")
+	if fieldIntVal(t, rs.Rows[0].Fields[0], "age") != 25 {
+		t.Errorf("bob's age should be restored to 25, got %v", rs.Rows[0].Fields[0].Value)
+	}
+	rs = mustExecSQL(t, ex, "SELECT * FROM users WHERE id = 1")
+	assertRowCount(t, rs, 1)
+	rs = mustExecSQL(t, ex, "SELECT * FROM users WHERE id = 3")
+	assertRowCount(t, rs, 0)
+}
+
+// ---- Lock-holding behavior ----
+
+func TestInsertLock_BlocksOtherExclusiveUntilCommit(t *testing.T) {
+	ex := setupUsersTable(t)
+	schema := ex.sc.FindTableSchema("users")
+
+	txn1 := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn1.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	key := encodeKey(schema.TableId, 1)
+	txn2 := ex.tm.Begin()
+	acquired := make(chan struct{})
+	go func() {
+		_ = ex.tm.Lock(txn2.Id, key, lock.LockExclusive)
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Error("txn2 should not acquire exclusive lock while txn1 INSERT is uncommitted")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ex.tm.Commit(txn1.Id)
+	select {
+	case <-acquired:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("txn2 should acquire lock after txn1 commits")
+	}
+	ex.tm.Commit(txn2.Id)
+}
+
+func TestInsertLock_ReleasedOnRollback(t *testing.T) {
+	ex := setupUsersTable(t)
+	schema := ex.sc.FindTableSchema("users")
+
+	txn1 := ex.tm.Begin()
+	mustExecInTxn(t, ex, txn1.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
+
+	key := encodeKey(schema.TableId, 1)
+	txn2 := ex.tm.Begin()
+	acquired := make(chan struct{})
+	go func() {
+		_ = ex.tm.Lock(txn2.Id, key, lock.LockExclusive)
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Error("txn2 should not acquire lock while txn1 holds it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ex.tm.Rollback(txn1.Id)
+	select {
+	case <-acquired:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("txn2 should acquire lock after txn1 rolls back")
+	}
+	ex.tm.Commit(txn2.Id)
 }
