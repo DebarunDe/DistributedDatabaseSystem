@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
@@ -23,6 +24,7 @@ const defaultCacheSize = 256
 type testDB struct {
 	ex   *sqllayer.Executor
 	sc   *sqllayer.SchemaCatalog
+	tm   *lock.TransactionManager
 	pm   pagemanager.PageManager // outermost layer (BufferPool)
 	path string
 }
@@ -74,9 +76,11 @@ func wrap(t *testing.T, disk pagemanager.PageManager, path string, loadSchemas b
 			t.Fatalf("LoadSchemas: %v", err)
 		}
 	}
+	tm := lock.NewTransactionManager(bt)
 	return &testDB{
-		ex:   sqllayer.NewExecutor(sc, bt),
+		ex:   sqllayer.NewExecutor(sc, bt, tm),
 		sc:   sc,
+		tm:   tm,
 		pm:   bp,
 		path: path,
 	}
@@ -119,7 +123,14 @@ func (db *testDB) run(query string) (*sqllayer.ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	return db.ex.Execute(stmt)
+	txn := db.tm.Begin()
+	rs, err := db.ex.Execute(stmt, txn.Id)
+	if err != nil {
+		db.tm.Rollback(txn.Id)
+		return nil, err
+	}
+	db.tm.Commit(txn.Id)
+	return rs, nil
 }
 
 // ---- Assertion helpers ----
@@ -1247,5 +1258,181 @@ func TestLifecycle_SchemaEvolutionAcrossSessions(t *testing.T) {
 	assertRowCount(t, rs, 1)
 	if strVal(t, rs.Rows[0].Fields[0]) != "30" {
 		t.Errorf("expected value='30'")
+	}
+}
+
+// ---- Rollback scenarios through the full stack ----
+
+// beginRun parses and executes query in a new transaction, returning the result and
+// the open transaction. The caller must call db.tm.Commit or db.tm.Rollback.
+func (db *testDB) beginRun(t *testing.T, query string) (*sqllayer.ResultSet, *lock.Transaction) {
+	t.Helper()
+	tokens, err := sqllayer.Tokenize(query)
+	if err != nil {
+		t.Fatalf("beginRun tokenize(%q): %v", query, err)
+	}
+	stmt, err := sqllayer.Parse(tokens)
+	if err != nil {
+		t.Fatalf("beginRun parse(%q): %v", query, err)
+	}
+	txn := db.tm.Begin()
+	rs, err := db.ex.Execute(stmt, txn.Id)
+	if err != nil {
+		db.tm.Rollback(txn.Id)
+		t.Fatalf("beginRun execute(%q): %v", query, err)
+	}
+	return rs, txn
+}
+
+func TestRollback_InsertRevertedInFullStack(t *testing.T) {
+	db := newTestDB(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+
+	_, txn := db.beginRun(t, "INSERT INTO t VALUES (1, 10)")
+	db.tm.Rollback(txn.Id)
+
+	rs := db.exec(t, "SELECT * FROM t")
+	assertRowCount(t, rs, 0)
+}
+
+func TestRollback_DeleteRevertedInFullStack(t *testing.T) {
+	db := newTestDB(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+
+	_, txn := db.beginRun(t, "DELETE FROM t WHERE id = 1")
+	db.tm.Rollback(txn.Id)
+
+	rs := db.exec(t, "SELECT * FROM t")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[1]) != 10 {
+		t.Errorf("v: expected 10 after DELETE rollback, got %d", intVal(t, rs.Rows[0].Fields[1]))
+	}
+}
+
+func TestRollback_UpdateRevertedInFullStack(t *testing.T) {
+	db := newTestDB(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+
+	_, txn := db.beginRun(t, "UPDATE t SET v = 99 WHERE id = 1")
+	db.tm.Rollback(txn.Id)
+
+	rs := db.exec(t, "SELECT v FROM t WHERE id = 1")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[0]) != 10 {
+		t.Errorf("v: expected 10 after UPDATE rollback, got %d", intVal(t, rs.Rows[0].Fields[0]))
+	}
+}
+
+func TestRollback_MixedOpsRevertedInFullStack(t *testing.T) {
+	// Commit rows 1 and 2. In one txn: delete row 1, update row 2, insert row 3. Rollback.
+	// Expected: rows 1 and 2 back to originals, row 3 absent.
+	db := newTestDB(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+	db.exec(t, "INSERT INTO t VALUES (2, 20)")
+
+	txn := db.tm.Begin()
+	for _, q := range []string{
+		"DELETE FROM t WHERE id = 1",
+		"UPDATE t SET v = 99 WHERE id = 2",
+		"INSERT INTO t VALUES (3, 30)",
+	} {
+		tokens, _ := sqllayer.Tokenize(q)
+		stmt, _ := sqllayer.Parse(tokens)
+		if _, err := db.ex.Execute(stmt, txn.Id); err != nil {
+			db.tm.Rollback(txn.Id)
+			t.Fatalf("execute(%q): %v", q, err)
+		}
+	}
+	db.tm.Rollback(txn.Id)
+
+	rs := db.exec(t, "SELECT * FROM t")
+	assertRowCount(t, rs, 2)
+
+	rs = db.exec(t, "SELECT v FROM t WHERE id = 1")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[0]) != 10 {
+		t.Errorf("row 1 v: expected 10 after rollback, got %d", intVal(t, rs.Rows[0].Fields[0]))
+	}
+
+	rs = db.exec(t, "SELECT v FROM t WHERE id = 2")
+	if intVal(t, rs.Rows[0].Fields[0]) != 20 {
+		t.Errorf("row 2 v: expected 20 after rollback, got %d", intVal(t, rs.Rows[0].Fields[0]))
+	}
+
+	rs = db.exec(t, "SELECT * FROM t WHERE id = 3")
+	assertRowCount(t, rs, 0)
+}
+
+func TestRollback_CommittedRowsSurvive(t *testing.T) {
+	db := newTestDB(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)") // committed
+
+	_, txn := db.beginRun(t, "INSERT INTO t VALUES (2, 20)")
+	db.tm.Rollback(txn.Id)
+
+	rs := db.exec(t, "SELECT * FROM t")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[0]) != 1 {
+		t.Error("only the committed row (id=1) should be visible")
+	}
+}
+
+func TestRollback_DeleteRevertedSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+
+	db := createAt(t, path)
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 42)")
+
+	_, txn := db.beginRun(t, "DELETE FROM t WHERE id = 1")
+	db.tm.Rollback(txn.Id) // row re-inserted in memory
+
+	db.close(t) // flush to disk
+
+	db2 := reopenAt(t, path)
+	defer db2.close(t)
+
+	rs := db2.exec(t, "SELECT * FROM t")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[1]) != 42 {
+		t.Errorf("v: expected 42 after reopen, got %d", intVal(t, rs.Rows[0].Fields[1]))
+	}
+}
+
+func TestRollback_UpdateRevertedSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+
+	db := createAt(t, path)
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+
+	_, txn := db.beginRun(t, "UPDATE t SET v = 99 WHERE id = 1")
+	db.tm.Rollback(txn.Id)
+
+	db.close(t)
+
+	db2 := reopenAt(t, path)
+	defer db2.close(t)
+
+	rs := db2.exec(t, "SELECT v FROM t WHERE id = 1")
+	assertRowCount(t, rs, 1)
+	if intVal(t, rs.Rows[0].Fields[0]) != 10 {
+		t.Errorf("v: expected 10 after reopen, got %d", intVal(t, rs.Rows[0].Fields[0]))
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
@@ -83,7 +84,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load schemas: %v\n", err)
 		os.Exit(1)
 	}
-	ex := sqllayer.NewExecutor(sc, bt)
+	tm := lock.NewTransactionManager(bt)
+	ex := sqllayer.NewExecutor(sc, bt, tm)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -110,11 +112,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
-		rs, err := ex.Execute(stmt)
+		txn := tm.Begin()
+		rs, err := ex.Execute(stmt, txn.Id)
 		if err != nil {
+			tm.Rollback(txn.Id)
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
+		tm.Commit(txn.Id)
 		if rs != nil {
 			printResults(rs)
 		} else {

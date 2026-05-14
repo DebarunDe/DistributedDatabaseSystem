@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 )
 
@@ -21,6 +22,7 @@ type ResultSet struct {
 type Executor struct {
 	sc *SchemaCatalog
 	bt *btree.BTree
+	tm *lock.TransactionManager
 }
 
 // Helpers
@@ -186,7 +188,7 @@ func evaluateExpression(expr Expression, schema *TableSchemaValue, fields []btre
 }
 
 // executeInsert executes a Insert statement
-func (ex *Executor) executeInsert(s *InsertStatement) (*ResultSet, error) {
+func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet, error) {
 	schema := ex.sc.FindTableSchema(s.Table)
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
@@ -210,6 +212,10 @@ func (ex *Executor) executeInsert(s *InsertStatement) (*ResultSet, error) {
 	}
 
 	encodedKey := encodeKey(schema.TableId, pkValue)
+
+	if err := ex.tm.Lock(txnId, encodedKey, lock.LockExclusive); err != nil {
+		return nil, fmt.Errorf("lock row %d: %w", encodedKey, err)
+	}
 
 	_, exists, err := ex.bt.Search(encodedKey)
 	if err != nil {
@@ -238,11 +244,13 @@ func (ex *Executor) executeInsert(s *InsertStatement) (*ResultSet, error) {
 		return nil, fmt.Errorf("insert failed: %w", err)
 	}
 
+	ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoInsert, Key: encodedKey, Fields: nil})
+
 	return nil, nil
 }
 
 // executeSelect executes a select statement
-func (ex *Executor) executeSelect(s *SelectStatement) (*ResultSet, error) {
+func (ex *Executor) executeSelect(s *SelectStatement, txnId uint64) (*ResultSet, error) {
 	schema := ex.sc.FindTableSchema(s.Table)
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
@@ -282,6 +290,9 @@ func (ex *Executor) executeSelect(s *SelectStatement) (*ResultSet, error) {
 
 	var rows []ResultRow
 	for _, r := range results {
+		if err := ex.tm.Lock(txnId, r.Key, lock.LockShared); err != nil {
+			return nil, fmt.Errorf("lock row %d: %w", r.Key, err)
+		}
 		if !evaluateExpression(s.Where, schema, r.Fields) {
 			continue
 		}
@@ -296,7 +307,7 @@ func (ex *Executor) executeSelect(s *SelectStatement) (*ResultSet, error) {
 }
 
 // executeUpdate executes a update statement
-func (ex *Executor) executeUpdate(s *UpdateStatement) (*ResultSet, error) {
+func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet, error) {
 	schema := ex.sc.FindTableSchema(s.Table)
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
@@ -325,6 +336,14 @@ func (ex *Executor) executeUpdate(s *UpdateStatement) (*ResultSet, error) {
 
 	for _, r := range results {
 		if evaluateExpression(s.Where, schema, r.Fields) {
+			if err := ex.tm.Lock(txnId, r.Key, lock.LockExclusive); err != nil {
+				return nil, fmt.Errorf("lock row %d: %w", r.Key, err)
+			}
+
+			oldFields := make([]btree.Field, len(r.Fields))
+			copy(oldFields, r.Fields)
+			ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoUpdate, Key: r.Key, Fields: oldFields})
+
 			i := findColumnIndex(s.Column, schema)
 
 			newField, err := literalToField(s.Value, schema.Columns[i-1].DataType, uint8(i))
@@ -343,7 +362,7 @@ func (ex *Executor) executeUpdate(s *UpdateStatement) (*ResultSet, error) {
 }
 
 // executeDelete executes a delete statement
-func (ex *Executor) executeDelete(s *DeleteStatement) (*ResultSet, error) {
+func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet, error) {
 	schema := ex.sc.FindTableSchema(s.Table)
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
@@ -357,6 +376,14 @@ func (ex *Executor) executeDelete(s *DeleteStatement) (*ResultSet, error) {
 
 	for _, r := range results {
 		if evaluateExpression(s.Where, schema, r.Fields) {
+			if err := ex.tm.Lock(txnId, r.Key, lock.LockExclusive); err != nil {
+				return nil, fmt.Errorf("lock row %d: %w", r.Key, err)
+			}
+
+			oldFields := make([]btree.Field, len(r.Fields))
+			copy(oldFields, r.Fields)
+			ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoDelete, Key: r.Key, Fields: oldFields})
+
 			if err := ex.bt.Delete(r.Key); err != nil {
 				return nil, fmt.Errorf("delete on key %d: %w", r.Key, err)
 			}
@@ -400,21 +427,21 @@ func (ex *Executor) executeDrop(s *DropTableStatement) (*ResultSet, error) {
 	return nil, nil
 }
 
-func NewExecutor(sc *SchemaCatalog, bt *btree.BTree) *Executor {
-	return &Executor{sc: sc, bt: bt}
+func NewExecutor(sc *SchemaCatalog, bt *btree.BTree, tm *lock.TransactionManager) *Executor {
+	return &Executor{sc: sc, bt: bt, tm: tm}
 }
 
 // Entrypoint
-func (ex *Executor) Execute(stmt Statement) (*ResultSet, error) {
+func (ex *Executor) Execute(stmt Statement, txnId uint64) (*ResultSet, error) {
 	switch s := stmt.(type) {
 	case *SelectStatement:
-		return ex.executeSelect(s)
+		return ex.executeSelect(s, txnId)
 	case *InsertStatement:
-		return ex.executeInsert(s)
+		return ex.executeInsert(s, txnId)
 	case *UpdateStatement:
-		return ex.executeUpdate(s)
+		return ex.executeUpdate(s, txnId)
 	case *DeleteStatement:
-		return ex.executeDelete(s)
+		return ex.executeDelete(s, txnId)
 	case *CreateTableStatement:
 		return ex.executeCreate(s)
 	case *DropTableStatement:
