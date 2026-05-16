@@ -775,6 +775,47 @@ func TestLockDeadlockQueueCleanup(t *testing.T) {
 	assertQueueLen(t, lm, 200, 1)
 }
 
+// --- lock upgrade: shared → exclusive ---
+
+func TestLockUpgradeSharedToExclusiveOnlyHolder(t *testing.T) {
+	lm := NewLockManager()
+	mustLock(t, lm, 1, 100, LockShared)
+
+	// Upgrade: txn1 is the only shared holder, should be granted exclusive immediately.
+	done := make(chan struct{})
+	go func() {
+		mustLock(t, lm, 1, 100, LockExclusive)
+		close(done)
+	}()
+
+	waitFor(t, done, 100*time.Millisecond, "upgrade should be granted immediately when sole holder")
+	assertLockType(t, lm, 100, LockExclusive)
+	assertHolders(t, lm, 100, []uint64{1})
+	assertTxnHolds(t, lm, 1, 100, LockExclusive)
+}
+
+func TestLockUpgradeSharedToExclusiveWithOtherHolders(t *testing.T) {
+	lm := NewLockManager()
+	mustLock(t, lm, 1, 100, LockShared)
+	mustLock(t, lm, 2, 100, LockShared)
+
+	// txn1 requests upgrade; must block while txn2 still holds shared.
+	upgradeDone := make(chan struct{})
+	go func() {
+		mustLock(t, lm, 1, 100, LockExclusive)
+		close(upgradeDone)
+	}()
+
+	notDone(t, upgradeDone, 50*time.Millisecond, "upgrade should block while another txn holds shared")
+
+	// After txn2 releases, txn1's upgrade should be granted.
+	lm.UnlockAll(2)
+	waitFor(t, upgradeDone, 100*time.Millisecond, "upgrade should be granted after other shared holder releases")
+	assertLockType(t, lm, 100, LockExclusive)
+	assertHolders(t, lm, 100, []uint64{1})
+	assertTxnHolds(t, lm, 1, 100, LockExclusive)
+}
+
 func TestLockDeadlockOtherWaitersUnaffected(t *testing.T) {
 	lm := NewLockManager()
 	mustLock(t, lm, 1, 100, LockExclusive)

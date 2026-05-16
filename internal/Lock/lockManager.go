@@ -83,9 +83,21 @@ func (lm *LockManager) Lock(txnId uint64, rowKey uint64, lockType LockType) erro
 	lm.mu.Lock()
 
 	if txnLocks := lm.transactionLocks[txnId]; txnLocks != nil {
-		if _, already := txnLocks.rows[rowKey]; already {
-			lm.mu.Unlock()
-			return nil
+		if existing, already := txnLocks.rows[rowKey]; already {
+			if existing >= lockType {
+				lm.mu.Unlock()
+				return nil
+			}
+			// Upgrade: shared → exclusive. Strip this txn from the holders
+			// so the normal grant/wait path below re-acquires at the new strength.
+			row := lm.rowLocks[rowKey]
+			row.holders = slices.DeleteFunc(row.holders, func(n uint64) bool {
+				return n == txnId
+			})
+			delete(lm.transactionLocks[txnId].rows, rowKey)
+			if len(row.holders) == 0 {
+				row.lockType = LockNone
+			}
 		}
 	}
 
