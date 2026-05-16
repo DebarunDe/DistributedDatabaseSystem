@@ -3,6 +3,7 @@ package btree
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
 )
@@ -12,6 +13,7 @@ const (
 )
 
 type BTree struct {
+	mu sync.Mutex
 	pm pagemanager.PageManager
 }
 
@@ -905,6 +907,9 @@ func (bt *BTree) handleUnderflow(page *pagemanager.Page, path []uint32) error {
 // Public API
 // Search looks for the given key in the B-Tree, returning the record bytes and whether it was found.
 func (bt *BTree) Search(key uint64) ([]Field, bool, error) {
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+
 	rootId := bt.pm.GetRootPageId()
 	if rootId == pagemanager.InvalidPageID {
 		return nil, false, nil
@@ -935,6 +940,9 @@ func (bt *BTree) Search(key uint64) ([]Field, bool, error) {
 
 // Insert inerts a new record with given key and value fields into the BTree, splitting pages and updating parent nodes as necessary.
 func (bt *BTree) Insert(key uint64, fields []Field) error {
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+
 	encodedRecord, err := EncodeLeafRecord(key, fields)
 	if err != nil {
 		return fmt.Errorf("failed to encode record: %w", err)
@@ -1022,6 +1030,9 @@ func (bt *BTree) Insert(key uint64, fields []Field) error {
 
 // Delete removes the record with the given key from the B-Tree, merging or redistributing pages and updating parent nodes as necessary to maintain B-Tree properties.
 func (bt *BTree) Delete(key uint64) error {
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+
 	if bt.pm.GetRootPageId() == pagemanager.InvalidPageID {
 		// Tree is empty, nothing to delete.
 		return nil
@@ -1085,6 +1096,8 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([]struct {
 	Key    uint64
 	Fields []Field
 }, error) {
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
 
 	if bt.pm.GetRootPageId() == pagemanager.InvalidPageID {
 		// Tree is empty, return empty result.

@@ -2,6 +2,7 @@ package lock
 
 import (
 	"slices"
+	"sync"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 )
@@ -35,6 +36,7 @@ type Transaction struct {
 }
 
 type TransactionManager struct {
+	mu     sync.Mutex
 	nextId uint64
 	active map[uint64]*Transaction
 	lm     *LockManager
@@ -51,6 +53,7 @@ func NewTransactionManager(bt *btree.BTree) *TransactionManager {
 }
 
 func (tm *TransactionManager) Begin() *Transaction {
+	tm.mu.Lock()
 	t := &Transaction{
 		Id:      tm.nextId,
 		Status:  TxnActive,
@@ -58,6 +61,7 @@ func (tm *TransactionManager) Begin() *Transaction {
 	}
 	tm.active[tm.nextId] = t
 	tm.nextId++
+	tm.mu.Unlock()
 	return t
 }
 
@@ -66,30 +70,42 @@ func (tm *TransactionManager) Lock(txnId uint64, rowKey uint64, lockType LockTyp
 }
 
 func (tm *TransactionManager) AppendUndo(txnId uint64, entry UndoEntry) {
+	tm.mu.Lock()
 	if t := tm.active[txnId]; t != nil {
 		t.UndoLog = append(t.UndoLog, entry)
 	}
+	tm.mu.Unlock()
 }
 
 func (tm *TransactionManager) Commit(txnId uint64) {
+	tm.mu.Lock()
 	t := tm.active[txnId]
 	if t == nil {
+		tm.mu.Unlock()
 		return
 	}
-
 	t.Status = TxnCommitted
-	tm.lm.UnlockAll(txnId)
 	t.UndoLog = nil
 	delete(tm.active, txnId)
+	tm.mu.Unlock()
+
+	tm.lm.UnlockAll(txnId)
 }
 
 func (tm *TransactionManager) Rollback(txnId uint64) {
+	tm.mu.Lock()
 	t := tm.active[txnId]
 	if t == nil {
+		tm.mu.Unlock()
 		return
 	}
+	undoLog := t.UndoLog
+	t.UndoLog = nil
+	t.Status = TxnAborted
+	delete(tm.active, txnId)
+	tm.mu.Unlock()
 
-	for _, entry := range slices.Backward(t.UndoLog) {
+	for _, entry := range slices.Backward(undoLog) {
 		switch entry.Op {
 		case UndoInsert:
 			_ = tm.bt.Delete(entry.Key)
@@ -101,6 +117,4 @@ func (tm *TransactionManager) Rollback(txnId uint64) {
 	}
 
 	tm.lm.UnlockAll(txnId)
-	t.Status = TxnAborted
-	delete(tm.active, txnId)
 }

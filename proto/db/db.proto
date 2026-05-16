@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package dbproto;
+
+option go_package = "github.com/your-username/DistributedDatabaseSystem/pkg/db;db";
+
+message SQLRequest {
+    string sql = 1;
+}
+
+message SQLResponse {
+    repeated string columns = 1;
+    repeated ResultRow rows = 2;
+}
+
+message ResultRow {
+    repeated FieldValue fields = 1;
+}
+
+message FieldValue {
+    oneof value {
+        int64 int_value = 1;
+        string string_value = 2;
+        bool bool_value = 3;
+    }
+}
+
+service SQLService {
+    rpc Execute(SQLRequest) returns (SQLResponse);
+}

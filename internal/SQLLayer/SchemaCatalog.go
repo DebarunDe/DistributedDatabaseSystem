@@ -2,6 +2,7 @@ package sqllayer
 
 import (
 	"fmt"
+	"sync"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 )
@@ -13,6 +14,7 @@ type TableSchemaValue struct {
 }
 
 type SchemaCatalog struct {
+	mu         sync.RWMutex
 	bt         *btree.BTree
 	cache      map[string]*TableSchemaValue
 	maxTableId uint32
@@ -33,6 +35,8 @@ func encodeKey(tableId uint32, primaryKey uint32) uint64 {
 
 // LoadSchemas rangescans over table 0's key range, decodes each row into TableSchemaValue, populates the cache, and tracks max table id
 func (sc *SchemaCatalog) LoadSchemas() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	results, err := sc.bt.RangeScan(encodeKey(0, 0), encodeKey(0, ^uint32(0)))
 	if err != nil {
 		return fmt.Errorf("range scan over table 0: %w", err)
@@ -115,8 +119,17 @@ func (sc *SchemaCatalog) LoadSchemas() error {
 	return nil
 }
 
+// NextTableId returns the table ID that will be assigned to the next CREATE TABLE.
+func (sc *SchemaCatalog) NextTableId() uint32 {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	return sc.maxTableId + 1
+}
+
 // CreateTable validates that table name to be added does not exist, assigns new table id, encodes as catalog row, and adds to cache
 func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, primaryKeyType string, columnNames []string, columnTypes []string) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	//validate tableName not in cache
 	if _, ok := sc.cache[tableName]; ok {
 		return fmt.Errorf("table Name: %s already exists", tableName)
@@ -188,6 +201,8 @@ func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, pr
 
 // DropTable checks the cache, deletes the key if present, and removes from cache
 func (sc *SchemaCatalog) DropTable(tableName string) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	//validate tableName in cache
 	if _, ok := sc.cache[tableName]; !ok {
 		return fmt.Errorf("table %q does not exist", tableName)
@@ -219,9 +234,7 @@ func (sc *SchemaCatalog) DropTable(tableName string) error {
 
 // FindTableSchema searches the cache for tableName
 func (sc *SchemaCatalog) FindTableSchema(tableName string) *TableSchemaValue {
-	if _, ok := sc.cache[tableName]; !ok {
-		return nil
-	}
-
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
 	return sc.cache[tableName]
 }
