@@ -44,7 +44,9 @@ func (s *sqlGRPCServer) Execute(_ context.Context, req *pb.SQLRequest) (*pb.SQLR
 		s.tm.Rollback(txn.Id)
 		return nil, status.Errorf(codes.Internal, "execute: %v", err)
 	}
-	s.tm.Commit(txn.Id)
+	if err := s.tm.Commit(txn.Id); err != nil {
+		return nil, status.Errorf(codes.Internal, "commit: %v", err)
+	}
 	if result == nil {
 		return &pb.SQLResponse{}, nil
 	}

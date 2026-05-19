@@ -11,6 +11,7 @@ import (
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
 )
 
 const defaultCacheSize = 256
@@ -84,7 +85,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load schemas: %v\n", err)
 		os.Exit(1)
 	}
-	tm := lock.NewTransactionManager(bt)
+	rm, err := replication.NewReplicationManager(*dbPath + "_repl.log")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open replication log: %v\n", err)
+		os.Exit(1)
+	}
+	tm := lock.NewTransactionManager(bt, rm)
 	ex := sqllayer.NewExecutor(sc, bt, tm)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -119,7 +125,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
-		tm.Commit(txn.Id)
+		if err := tm.Commit(txn.Id); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			continue
+		}
 		if rs != nil {
 			printResults(rs)
 		} else {

@@ -14,6 +14,7 @@ import (
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
 )
 
 // ---- Infrastructure ----
@@ -76,7 +77,7 @@ func wrap(t *testing.T, disk pagemanager.PageManager, path string, loadSchemas b
 			t.Fatalf("LoadSchemas: %v", err)
 		}
 	}
-	tm := lock.NewTransactionManager(bt)
+	tm := lock.NewTransactionManager(bt, nil)
 	return &testDB{
 		ex:   sqllayer.NewExecutor(sc, bt, tm),
 		sc:   sc,
@@ -129,7 +130,9 @@ func (db *testDB) run(query string) (*sqllayer.ResultSet, error) {
 		db.tm.Rollback(txn.Id)
 		return nil, err
 	}
-	db.tm.Commit(txn.Id)
+	if err := db.tm.Commit(txn.Id); err != nil {
+		return nil, err
+	}
 	return rs, nil
 }
 
@@ -1434,5 +1437,235 @@ func TestRollback_UpdateRevertedSurvivesReopen(t *testing.T) {
 	assertRowCount(t, rs, 1)
 	if intVal(t, rs.Rows[0].Fields[0]) != 10 {
 		t.Errorf("v: expected 10 after reopen, got %d", intVal(t, rs.Rows[0].Fields[0]))
+	}
+}
+
+// ---- Replication integration ----
+
+// wrapWithReplication layers everything like wrap but also opens a ReplicationManager
+// at path+"_repl.log" and wires it into the TransactionManager.
+func wrapWithReplication(t *testing.T, disk pagemanager.PageManager, path string, loadSchemas bool) (*testDB, *replication.ReplicationManager) {
+	t.Helper()
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		_ = disk.Close()
+		t.Fatalf("NewWAL: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(wal, defaultCacheSize)
+	bt := btree.NewBTree(bp)
+	sc := sqllayer.NewSchemaCatalog(bt)
+	if loadSchemas {
+		if err := sc.LoadSchemas(); err != nil {
+			_ = bp.Close()
+			t.Fatalf("LoadSchemas: %v", err)
+		}
+	}
+	rm, err := replication.NewReplicationManager(path + "_repl.log")
+	if err != nil {
+		_ = bp.Close()
+		t.Fatalf("NewReplicationManager: %v", err)
+	}
+	tm := lock.NewTransactionManager(bt, rm)
+	db := &testDB{
+		ex:   sqllayer.NewExecutor(sc, bt, tm),
+		sc:   sc,
+		tm:   tm,
+		pm:   bp,
+		path: path,
+	}
+	return db, rm
+}
+
+func newTestDBWithReplication(t *testing.T) (*testDB, *replication.ReplicationManager) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.db")
+	disk, err := pagemanager.NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	db, rm := wrapWithReplication(t, disk, path, false)
+	t.Cleanup(func() {
+		_ = os.Remove(path)
+		_ = os.Remove(path + "_WAL")
+		_ = os.Remove(path + "_repl.log")
+	})
+	return db, rm
+}
+
+func TestReplication_InsertAppearsInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 replication entry after INSERT, got %d", len(entries))
+	}
+	if entries[0].Op != replication.ReplPut {
+		t.Errorf("entry Op: got %v, want ReplPut", entries[0].Op)
+	}
+}
+
+func TestReplication_UpdateAppearsInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+	db.exec(t, "UPDATE t SET v = 99 WHERE id = 1")
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	// entry 0 = INSERT, entry 1 = UPDATE
+	if len(entries) != 2 {
+		t.Fatalf("want 2 replication entries, got %d", len(entries))
+	}
+	if entries[1].Op != replication.ReplPut {
+		t.Errorf("update entry Op: got %v, want ReplPut", entries[1].Op)
+	}
+}
+
+func TestReplication_DeleteAppearsInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+	db.exec(t, "DELETE FROM t WHERE id = 1")
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 replication entries, got %d", len(entries))
+	}
+	if entries[1].Op != replication.ReplDelete {
+		t.Errorf("delete entry Op: got %v, want ReplDelete", entries[1].Op)
+	}
+	if entries[1].Fields != nil {
+		t.Error("delete entry should have nil Fields")
+	}
+}
+
+func TestReplication_RollbackNotInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+
+	_, txn := db.beginRun(t, "INSERT INTO t VALUES (1, 10)")
+	db.tm.Rollback(txn.Id)
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("rolled-back INSERT must not appear in replication log, got %d entries", len(entries))
+	}
+}
+
+func TestReplication_MultipleOpsAllInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+	db.exec(t, "INSERT INTO t VALUES (2, 20)")
+	db.exec(t, "UPDATE t SET v = 99 WHERE id = 1")
+	db.exec(t, "DELETE FROM t WHERE id = 2")
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("want 4 replication entries, got %d", len(entries))
+	}
+	ops := []replication.ReplOp{replication.ReplPut, replication.ReplPut, replication.ReplPut, replication.ReplDelete}
+	for i, want := range ops {
+		if entries[i].Op != want {
+			t.Errorf("entries[%d].Op: got %v, want %v", i, entries[i].Op, want)
+		}
+	}
+}
+
+func TestReplication_LSNsMonotonicallyIncrease(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	for i := 1; i <= 5; i++ {
+		db.exec(t, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i))
+	}
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 5 {
+		t.Fatalf("want 5 entries, got %d", len(entries))
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i].LSN <= entries[i-1].LSN {
+			t.Errorf("LSN not strictly increasing at %d: %d <= %d", i, entries[i].LSN, entries[i-1].LSN)
+		}
+	}
+}
+
+func TestReplication_OnlyCommittedTxnsInLog(t *testing.T) {
+	db, rm := newTestDBWithReplication(t)
+	defer db.close(t)
+
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)") // committed — appears in log
+
+	_, aborted := db.beginRun(t, "INSERT INTO t VALUES (2, 20)")
+	db.tm.Rollback(aborted.Id) // aborted — must NOT appear in log
+
+	db.exec(t, "INSERT INTO t VALUES (3, 30)") // committed — appears in log
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries (committed only), got %d", len(entries))
+	}
+}
+
+func TestReplication_LogSurvivesDBReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	disk, err := pagemanager.NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	db, _ := wrapWithReplication(t, disk, path, false)
+	db.exec(t, "CREATE TABLE t (id INT, v INT)")
+	db.exec(t, "INSERT INTO t VALUES (1, 10)")
+	db.exec(t, "INSERT INTO t VALUES (2, 20)")
+	db.close(t)
+
+	// Reopen the replication log independently and verify entries are still there.
+	rm2, err := replication.NewReplicationManager(path + "_repl.log")
+	if err != nil {
+		t.Fatalf("reopen ReplicationManager: %v", err)
+	}
+	entries, err := rm2.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom after reopen: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries after reopen, got %d", len(entries))
 	}
 }

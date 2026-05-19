@@ -18,6 +18,7 @@ import (
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
 	pb "github.com/your-username/DistributedDatabaseSystem/proto/db"
 )
 
@@ -95,7 +96,9 @@ func (s *server) Execute(ctx context.Context, req *pb.SQLRequest) (*pb.SQLRespon
 		s.tm.Rollback(txn.Id)
 		return nil, status.Errorf(codes.Internal, "execute: %v", err)
 	}
-	s.tm.Commit(txn.Id)
+	if err := s.tm.Commit(txn.Id); err != nil {
+		return nil, status.Errorf(codes.Internal, "commit: %v", err)
+	}
 
 	if result == nil {
 		return &pb.SQLResponse{}, nil
@@ -138,7 +141,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load schemas: %v\n", err)
 		os.Exit(1)
 	}
-	tm := lock.NewTransactionManager(bt)
+	rm, err := replication.NewReplicationManager(*dbPath + "_repl.log")
+	if err != nil {
+		log.Fatalf("open replication log: %v", err)
+	}
+	tm := lock.NewTransactionManager(bt, rm)
 	ex := sqllayer.NewExecutor(sc, bt, tm)
 	srv := &server{tm: tm, ex: ex}
 

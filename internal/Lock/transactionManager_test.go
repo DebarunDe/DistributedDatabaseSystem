@@ -6,6 +6,7 @@ import (
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
 )
 
 // ---- helpers ----
@@ -20,11 +21,29 @@ func newTMBTree(t *testing.T) *btree.BTree {
 	return btree.NewBTree(pm)
 }
 
-// newTestTM returns a TransactionManager and the BTree it owns.
+// newTestTM returns a TransactionManager (no replication) and the BTree it owns.
 func newTestTM(t *testing.T) (*TransactionManager, *btree.BTree) {
 	t.Helper()
 	bt := newTMBTree(t)
-	return NewTransactionManager(bt), bt
+	return NewTransactionManager(bt, nil), bt
+}
+
+func mustCommit(t *testing.T, tm *TransactionManager, txnId uint64) {
+	t.Helper()
+	if err := tm.Commit(txnId); err != nil {
+		t.Fatalf("Commit(%d): %v", txnId, err)
+	}
+}
+
+// newTestTMWithRM returns a TransactionManager wired to a real ReplicationManager.
+func newTestTMWithRM(t *testing.T) (*TransactionManager, *btree.BTree, *replication.ReplicationManager) {
+	t.Helper()
+	bt := newTMBTree(t)
+	rm, err := replication.NewReplicationManager(t.TempDir() + "/repl.log")
+	if err != nil {
+		t.Fatalf("NewReplicationManager: %v", err)
+	}
+	return NewTransactionManager(bt, rm), bt, rm
 }
 
 // intFields builds a single-field slice with an INT value, used as a minimal row.
@@ -73,6 +92,19 @@ func assertNotInActive(t *testing.T, tm *TransactionManager, txnId uint64) {
 	t.Helper()
 	if _, ok := tm.active[txnId]; ok {
 		t.Errorf("txn %d: expected not in active map", txnId)
+	}
+}
+
+// ---- Begin (redo log init) ----
+
+func TestBegin_RedoLogInitialized(t *testing.T) {
+	tm, _ := newTestTM(t)
+	txn := tm.Begin()
+	if txn.RedoLog == nil {
+		t.Error("RedoLog should be non-nil after Begin")
+	}
+	if len(txn.RedoLog) != 0 {
+		t.Errorf("RedoLog should be empty, got len=%d", len(txn.RedoLog))
 	}
 }
 
@@ -260,14 +292,14 @@ func TestAppendUndo_DoesNotCrossContaminateTxns(t *testing.T) {
 func TestCommit_RemovesFromActiveMap(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.Commit(txn.Id)
+	mustCommit(t, tm, txn.Id)
 	assertNotInActive(t, tm, txn.Id)
 }
 
 func TestCommit_SetsStatusCommitted(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.Commit(txn.Id)
+	mustCommit(t, tm, txn.Id)
 	if txn.Status != TxnCommitted {
 		t.Errorf("status: got %v, want TxnCommitted", txn.Status)
 	}
@@ -277,7 +309,7 @@ func TestCommit_ClearsUndoLog(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
 	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	tm.Commit(txn.Id)
+	mustCommit(t, tm, txn.Id)
 	if txn.UndoLog != nil {
 		t.Error("UndoLog should be nil after commit")
 	}
@@ -298,27 +330,27 @@ func TestCommit_ReleasesLocks(t *testing.T) {
 	}()
 	time.Sleep(30 * time.Millisecond)
 
-	tm.Commit(t1.Id)
+	mustCommit(t, tm, t1.Id)
 	waitFor(t, t2Locked, 100*time.Millisecond, "t2 should acquire lock after t1 commits")
 }
 
 func TestCommit_UnknownTxnIdIsNoop(t *testing.T) {
 	tm, _ := newTestTM(t)
-	tm.Commit(999) // must not panic
+	mustCommit(t, tm, 999) // must not panic
 }
 
 func TestCommit_DoubleCommitIsNoop(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.Commit(txn.Id)
-	tm.Commit(txn.Id) // must not panic
+	mustCommit(t, tm, txn.Id)
+	mustCommit(t, tm, txn.Id) // must not panic
 }
 
 func TestCommit_DoesNotAffectOtherTransactions(t *testing.T) {
 	tm, _ := newTestTM(t)
 	t1 := tm.Begin()
 	t2 := tm.Begin()
-	tm.Commit(t1.Id)
+	mustCommit(t, tm, t1.Id)
 	assertNotInActive(t, tm, t1.Id)
 	assertInActive(t, tm, t2.Id)
 }
@@ -522,8 +554,8 @@ func TestMultiTxn_CommitOneRollbackOther(t *testing.T) {
 	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 100})
 	tm.AppendUndo(t2.Id, UndoEntry{Op: UndoInsert, Key: 200})
 
-	tm.Commit(t1.Id)   // row 100 persists
-	tm.Rollback(t2.Id) // row 200 deleted
+	mustCommit(t, tm, t1.Id) // row 100 persists
+	tm.Rollback(t2.Id)       // row 200 deleted
 
 	assertBTreeKeyValue(t, bt, 100, 1)
 	assertBTreeKeyAbsent(t, bt, 200)
@@ -534,7 +566,7 @@ func TestMultiTxn_CommitOneRollbackOther(t *testing.T) {
 func TestMultiTxn_IdsNotReusedAfterCommit(t *testing.T) {
 	tm, _ := newTestTM(t)
 	t1 := tm.Begin()
-	tm.Commit(t1.Id)
+	mustCommit(t, tm, t1.Id)
 	t2 := tm.Begin()
 	if t2.Id <= t1.Id {
 		t.Errorf("new txn ID (%d) should be greater than committed txn ID (%d)", t2.Id, t1.Id)
@@ -581,8 +613,8 @@ func TestMultiTxn_ConcurrentLocksThenCommit(t *testing.T) {
 		t.Fatalf("t2 lock row 200: %v", err)
 	}
 
-	tm.Commit(t1.Id)
-	tm.Commit(t2.Id)
+	mustCommit(t, tm, t1.Id)
+	mustCommit(t, tm, t2.Id)
 
 	assertNotInActive(t, tm, t1.Id)
 	assertNotInActive(t, tm, t2.Id)
@@ -607,15 +639,160 @@ func TestMultiTxn_ThreeTransactionsSerialised(t *testing.T) {
 	go func() { _ = tm.Lock(t3.Id, 100, LockExclusive); close(t3Done) }()
 	time.Sleep(20 * time.Millisecond)
 
-	tm.Commit(t1.Id)
+	mustCommit(t, tm, t1.Id)
 	waitFor(t, t2Done, 100*time.Millisecond, "t2 should be granted after t1 commits")
 	notDone(t, t3Done, 30*time.Millisecond, "t3 should wait while t2 holds")
 
-	tm.Commit(t2.Id)
+	mustCommit(t, tm, t2.Id)
 	waitFor(t, t3Done, 100*time.Millisecond, "t3 should be granted after t2 commits")
 
-	tm.Commit(t3.Id)
+	mustCommit(t, tm, t3.Id)
 	assertNotInActive(t, tm, t1.Id)
 	assertNotInActive(t, tm, t2.Id)
 	assertNotInActive(t, tm, t3.Id)
+}
+
+// ---- AppendRedo ----
+
+func TestAppendRedo_SingleEntry(t *testing.T) {
+	tm, _ := newTestTM(t)
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 100})
+	if len(txn.RedoLog) != 1 {
+		t.Fatalf("RedoLog len: got %d, want 1", len(txn.RedoLog))
+	}
+	e := txn.RedoLog[0]
+	if e.Op != replication.ReplPut || e.Key != 100 {
+		t.Errorf("entry: got {Op:%v Key:%d}, want {ReplPut 100}", e.Op, e.Key)
+	}
+}
+
+func TestAppendRedo_PreservesInsertionOrder(t *testing.T) {
+	tm, _ := newTestTM(t)
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 2})
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 3})
+
+	if len(txn.RedoLog) != 3 {
+		t.Fatalf("RedoLog len: got %d, want 3", len(txn.RedoLog))
+	}
+	if txn.RedoLog[0].Key != 1 || txn.RedoLog[1].Key != 2 || txn.RedoLog[2].Key != 3 {
+		t.Errorf("insertion order not preserved: keys %d %d %d", txn.RedoLog[0].Key, txn.RedoLog[1].Key, txn.RedoLog[2].Key)
+	}
+}
+
+func TestAppendRedo_UnknownTxnIdIsNoop(t *testing.T) {
+	tm, _ := newTestTM(t)
+	tm.AppendRedo(999, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1}) // must not panic
+}
+
+func TestAppendRedo_DoesNotCrossContaminateTxns(t *testing.T) {
+	tm, _ := newTestTM(t)
+	t1 := tm.Begin()
+	t2 := tm.Begin()
+
+	tm.AppendRedo(t1.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 100})
+	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 200})
+
+	if len(tm.active[t1.Id].RedoLog) != 1 || tm.active[t1.Id].RedoLog[0].Key != 100 {
+		t.Error("t1 redo log contaminated by t2's entry")
+	}
+	if len(tm.active[t2.Id].RedoLog) != 1 || tm.active[t2.Id].RedoLog[0].Key != 200 {
+		t.Error("t2 redo log contaminated by t1's entry")
+	}
+}
+
+// ---- Commit + replication ----
+
+func TestCommit_FlushesRedoLogToReplicationManager(t *testing.T) {
+	tm, _, rm := newTestTMWithRM(t)
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 42})
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 99})
+	mustCommit(t, tm, txn.Id)
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 replication entries, got %d", len(entries))
+	}
+	if entries[0].Key != 42 || entries[0].Op != replication.ReplPut {
+		t.Errorf("entry 0: got {Key:%d Op:%v}, want {42 ReplPut}", entries[0].Key, entries[0].Op)
+	}
+	if entries[1].Key != 99 || entries[1].Op != replication.ReplDelete {
+		t.Errorf("entry 1: got {Key:%d Op:%v}, want {99 ReplDelete}", entries[1].Key, entries[1].Op)
+	}
+}
+
+func TestCommit_ClearsRedoLog(t *testing.T) {
+	tm, _ := newTestTM(t)
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	mustCommit(t, tm, txn.Id)
+	if txn.RedoLog != nil {
+		t.Error("RedoLog should be nil after commit")
+	}
+}
+
+func TestCommit_EmptyRedoLog_NothingWrittenToReplication(t *testing.T) {
+	tm, _, rm := newTestTMWithRM(t)
+	txn := tm.Begin()
+	mustCommit(t, tm, txn.Id) // no redo entries
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("empty redo log: want 0 replication entries, got %d", len(entries))
+	}
+}
+
+func TestCommit_NilReplicationManager_DoesNotPanic(t *testing.T) {
+	tm, _ := newTestTM(t) // rm=nil
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	mustCommit(t, tm, txn.Id) // must not panic
+}
+
+func TestCommit_MultipleTransactions_AllFlushedInOrder(t *testing.T) {
+	tm, _, rm := newTestTMWithRM(t)
+
+	t1 := tm.Begin()
+	tm.AppendRedo(t1.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	mustCommit(t, tm, t1.Id)
+
+	t2 := tm.Begin()
+	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 2})
+	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 3})
+	mustCommit(t, tm, t2.Id)
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("want 3 total replication entries, got %d", len(entries))
+	}
+	if entries[0].Key != 1 || entries[1].Key != 2 || entries[2].Key != 3 {
+		t.Errorf("keys out of order: got %d %d %d, want 1 2 3", entries[0].Key, entries[1].Key, entries[2].Key)
+	}
+}
+
+func TestRollback_DoesNotWriteToReplicationLog(t *testing.T) {
+	tm, _, rm := newTestTMWithRM(t)
+	txn := tm.Begin()
+	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	tm.Rollback(txn.Id)
+
+	entries, err := rm.ReadFrom(0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("rollback must not write to replication log, got %d entries", len(entries))
+	}
 }
