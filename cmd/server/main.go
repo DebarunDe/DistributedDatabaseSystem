@@ -20,6 +20,7 @@ import (
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
 	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
 	pb "github.com/your-username/DistributedDatabaseSystem/proto/db"
+	repl "github.com/your-username/DistributedDatabaseSystem/proto/repl"
 )
 
 type server struct {
@@ -107,18 +108,21 @@ func (s *server) Execute(ctx context.Context, req *pb.SQLRequest) (*pb.SQLRespon
 	return resp, nil
 }
 
-func startSignalHandler(grpcServer *grpc.Server) {
+func startSignalHandler(servers ...*grpc.Server) {
 	sigCh := make(chan os.Signal, 1)
 
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
-	grpcServer.GracefulStop()
+	for _, s := range servers {
+		s.GracefulStop()
+	}
 }
 
 func main() {
 	dbPath := flag.String("db", "", "path to database file (required)")
 	port := flag.String("port", "5555", "port to listen on")
+	replPort := flag.String("repl-port", "5556", "port to listen on for replication")
 	flag.Parse()
 
 	if *dbPath == "" {
@@ -157,9 +161,22 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterSQLServiceServer(grpcServer, srv)
 
-	log.Printf("server listening on %s", *port)
+	replLis, err := net.Listen("tcp", ":"+*replPort)
+	if err != nil {
+		log.Fatalf("repl listen: %v", err)
+	}
+	replServer := grpc.NewServer()
+	repl.RegisterReplicationServiceServer(replServer, replication.NewReplicationServer(rm))
 
-	go startSignalHandler(grpcServer)
+	log.Printf("server listening on %s", *port)
+	log.Printf("replication server listening on %s", *replPort)
+
+	go startSignalHandler(grpcServer, replServer)
+	go func() {
+		if err := replServer.Serve(replLis); err != nil {
+			log.Fatalf("repl serve: %v", err)
+		}
+	}()
 
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)

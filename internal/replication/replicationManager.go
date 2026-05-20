@@ -25,6 +25,7 @@ type ReplicationManager struct {
 	mu      sync.Mutex
 	nextLSN uint64
 	file    *os.File
+	cond    *sync.Cond
 }
 
 const (

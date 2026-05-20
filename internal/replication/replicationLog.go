@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 )
@@ -18,6 +19,7 @@ func NewReplicationManager(path string) (*ReplicationManager, error) {
 	}
 
 	rm := &ReplicationManager{file: file}
+	rm.cond = sync.NewCond(&rm.mu)
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		_ = file.Close()
@@ -123,6 +125,7 @@ func (rm *ReplicationManager) appendOne(op ReplOp, key uint64, fields []btree.Fi
 	}
 
 	rm.nextLSN++
+	rm.cond.Broadcast()
 	return assignedLSN, nil
 }
 
