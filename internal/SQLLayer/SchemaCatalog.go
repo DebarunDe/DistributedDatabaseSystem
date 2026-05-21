@@ -37,6 +37,8 @@ func encodeKey(tableId uint32, primaryKey uint32) uint64 {
 func (sc *SchemaCatalog) LoadSchemas() error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.cache = make(map[string]*TableSchemaValue)
+	sc.maxTableId = 0
 	results, err := sc.bt.RangeScan(encodeKey(0, 0), encodeKey(0, ^uint32(0)))
 	if err != nil {
 		return fmt.Errorf("range scan over table 0: %w", err)
