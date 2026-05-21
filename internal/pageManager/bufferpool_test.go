@@ -15,24 +15,28 @@ import (
 // Optional function fields override the default behaviour of each method.
 // Methods with no override panic to catch accidental calls.
 type spyDisk struct {
-	pages         map[uint32]*Page
-	readCount     int
-	writeCount    int
-	writeFn       func(*Page) error
-	readFn        func(uint32) (*Page, error)
-	allocateFn    func() (*Page, error)
-	allocateCount int
-	freeFn        func(uint32) error
-	freeCount     int
-	freedPages    []uint32
-	getRootFn     func() uint32
-	setRootFn     func(uint32) error
-	setRootCount  int
-	lastRootSet   uint32
-	closeFn       func() error
-	closeCalled   bool
-	deleteFn      func() error
-	deleteCalled  bool
+	pages              map[uint32]*Page
+	readCount          int
+	writeCount         int
+	writeFn            func(*Page) error
+	readFn             func(uint32) (*Page, error)
+	allocateFn         func() (*Page, error)
+	allocateCount      int
+	freeFn             func(uint32) error
+	freeCount          int
+	freedPages         []uint32
+	getRootFn          func() uint32
+	setRootFn          func(uint32) error
+	setRootCount       int
+	lastRootSet        uint32
+	closeFn            func() error
+	closeCalled        bool
+	deleteFn           func() error
+	deleteCalled       bool
+	getCheckpointFn    func() uint64
+	setCheckpointFn    func(uint64) error
+	setCheckpointCount int
+	lastCheckpointSet  uint64
 }
 
 func newSpyDisk(pages ...*Page) *spyDisk {
@@ -113,6 +117,22 @@ func (s *spyDisk) Delete() error {
 		return s.deleteFn()
 	}
 	panic("spyDisk.Delete not implemented")
+}
+
+func (s *spyDisk) GetMetaCheckpointLSN() uint64 {
+	if s.getCheckpointFn != nil {
+		return s.getCheckpointFn()
+	}
+	return 0
+}
+
+func (s *spyDisk) SetMetaCheckpointLSN(lsn uint64) error {
+	s.setCheckpointCount++
+	s.lastCheckpointSet = lsn
+	if s.setCheckpointFn != nil {
+		return s.setCheckpointFn(lsn)
+	}
+	return nil
 }
 
 // newBP creates a BufferPoolImpl backed by the given PageManager.
@@ -1686,5 +1706,49 @@ func TestBufferPool_Delete_EmptyPool_Succeeds(t *testing.T) {
 	}
 	if !disk.deleteCalled {
 		t.Error("disk.Delete should be called")
+	}
+}
+
+// ============================================================
+// GetMetaCheckpointLSN / SetMetaCheckpointLSN — BufferPool delegation
+// ============================================================
+
+// GetMetaCheckpointLSN must delegate to the underlying disk and return its value.
+func TestBufferPool_GetMetaCheckpointLSN_DelegatesToDisk(t *testing.T) {
+	const want uint64 = 42
+	disk := newSpyDisk()
+	disk.getCheckpointFn = func() uint64 { return want }
+	bp := newBP(disk, 4)
+
+	if got := bp.GetMetaCheckpointLSN(); got != want {
+		t.Errorf("GetMetaCheckpointLSN() = %d, want %d", got, want)
+	}
+}
+
+// SetMetaCheckpointLSN must delegate to disk and record the value.
+func TestBufferPool_SetMetaCheckpointLSN_DelegatesToDisk(t *testing.T) {
+	const want uint64 = 99
+	disk := newSpyDisk()
+	bp := newBP(disk, 4)
+
+	if err := bp.SetMetaCheckpointLSN(want); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN(%d): %v", want, err)
+	}
+	if disk.setCheckpointCount != 1 {
+		t.Errorf("disk.SetMetaCheckpointLSN call count = %d, want 1", disk.setCheckpointCount)
+	}
+	if disk.lastCheckpointSet != want {
+		t.Errorf("disk received lsn = %d, want %d", disk.lastCheckpointSet, want)
+	}
+}
+
+// SetMetaCheckpointLSN must propagate errors from disk.
+func TestBufferPool_SetMetaCheckpointLSN_PropagatesError(t *testing.T) {
+	disk := newSpyDisk()
+	disk.setCheckpointFn = func(_ uint64) error { return errors.New("disk full") }
+	bp := newBP(disk, 4)
+
+	if err := bp.SetMetaCheckpointLSN(1); err == nil {
+		t.Error("SetMetaCheckpointLSN should propagate disk error")
 	}
 }

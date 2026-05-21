@@ -1617,11 +1617,12 @@ func TestReplication_CommitFlushesInsertToLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("want 1 replication entry after INSERT commit, got %d", len(entries))
+	// entry 0 = CREATE TABLE schema row, entry 1 = INSERT
+	if len(entries) != 2 {
+		t.Fatalf("want 2 replication entries after INSERT commit, got %d", len(entries))
 	}
-	if entries[0].Op != replication.ReplPut {
-		t.Errorf("entry Op: got %v, want ReplPut", entries[0].Op)
+	if entries[1].Op != replication.ReplPut {
+		t.Errorf("entry Op: got %v, want ReplPut", entries[1].Op)
 	}
 }
 
@@ -1634,12 +1635,12 @@ func TestReplication_CommitFlushesDeleteToLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	// first entry = INSERT, second = DELETE
-	if len(entries) != 2 {
-		t.Fatalf("want 2 replication entries, got %d", len(entries))
+	// entry 0 = CREATE TABLE, entry 1 = INSERT, entry 2 = DELETE
+	if len(entries) != 3 {
+		t.Fatalf("want 3 replication entries, got %d", len(entries))
 	}
-	if entries[1].Op != replication.ReplDelete {
-		t.Errorf("second entry Op: got %v, want ReplDelete", entries[1].Op)
+	if entries[2].Op != replication.ReplDelete {
+		t.Errorf("delete entry Op: got %v, want ReplDelete", entries[2].Op)
 	}
 }
 
@@ -1652,11 +1653,12 @@ func TestReplication_CommitFlushesUpdateToLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("want 2 replication entries, got %d", len(entries))
+	// entry 0 = CREATE TABLE, entry 1 = INSERT, entry 2 = UPDATE
+	if len(entries) != 3 {
+		t.Fatalf("want 3 replication entries, got %d", len(entries))
 	}
-	if entries[1].Op != replication.ReplPut {
-		t.Errorf("update entry Op: got %v, want ReplPut", entries[1].Op)
+	if entries[2].Op != replication.ReplPut {
+		t.Errorf("update entry Op: got %v, want ReplPut", entries[2].Op)
 	}
 }
 
@@ -1671,8 +1673,9 @@ func TestReplication_RollbackDoesNotFlushToLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Errorf("rollback must not write to replication log, got %d entries", len(entries))
+	// CREATE TABLE is committed before the rolled-back INSERT, so 1 entry exists.
+	if len(entries) != 1 {
+		t.Errorf("only the CREATE TABLE entry should be in log, got %d entries", len(entries))
 	}
 }
 
@@ -1686,8 +1689,9 @@ func TestReplication_LSNsMonotonicallyIncrease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("want 3 replication entries, got %d", len(entries))
+	// entry 0 = CREATE TABLE, entries 1-3 = INSERT/INSERT/DELETE
+	if len(entries) != 4 {
+		t.Fatalf("want 4 replication entries, got %d", len(entries))
 	}
 	for i := 1; i < len(entries); i++ {
 		if entries[i].LSN <= entries[i-1].LSN {
@@ -1698,18 +1702,18 @@ func TestReplication_LSNsMonotonicallyIncrease(t *testing.T) {
 
 func TestReplication_ReadFrom_FiltersCommittedEntries(t *testing.T) {
 	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)") // LSN 0
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")   // LSN 1
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (3, 'carol', 35)") // LSN 2
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)") // LSN 1 (LSN 0 = CREATE TABLE)
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")   // LSN 2
+	mustExecSQL(t, ex, "INSERT INTO users VALUES (3, 'carol', 35)") // LSN 3
 
-	entries, err := rm.ReadFrom(1)
+	entries, err := rm.ReadFrom(2)
 	if err != nil {
-		t.Fatalf("ReadFrom(1): %v", err)
+		t.Fatalf("ReadFrom(2): %v", err)
 	}
 	if len(entries) != 2 {
-		t.Errorf("ReadFrom(1): want 2 entries (LSN 1,2), got %d", len(entries))
+		t.Errorf("ReadFrom(2): want 2 entries (LSN 2,3), got %d", len(entries))
 	}
-	if len(entries) > 0 && entries[0].LSN != 1 {
-		t.Errorf("first entry LSN: got %d, want 1", entries[0].LSN)
+	if len(entries) > 0 && entries[0].LSN != 2 {
+		t.Errorf("first entry LSN: got %d, want 2", entries[0].LSN)
 	}
 }

@@ -25,7 +25,17 @@ func fieldToProto(f btree.Field) (*pb.FieldValue, error) {
 	case btree.NullValue:
 		return &pb.FieldValue{}, nil
 	case btree.ListValue:
-		return nil, fmt.Errorf("ListValue not supported in replication proto (tag %d)", f.Tag)
+		elems := make([]*pb.FieldValue, len(v.Elems))
+		for i, e := range v.Elems {
+			pv, err := fieldToProto(btree.Field{Tag: 0, Value: e})
+			if err != nil {
+				return nil, fmt.Errorf("list element %d (tag %d): %w", i, f.Tag, err)
+			}
+			elems[i] = pv
+		}
+		return &pb.FieldValue{Value: &pb.FieldValue_ListValue{
+			ListValue: &pb.FieldList{ElemType: uint32(v.ElemType), Elems: elems},
+		}}, nil
 	default:
 		return nil, fmt.Errorf("unknown field value type (tag %d)", f.Tag)
 	}

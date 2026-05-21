@@ -451,6 +451,14 @@ func (ex *Executor) executeCreate(s *CreateTableStatement, txnId uint64) (*Resul
 		return nil, fmt.Errorf("create table %q: %w", s.Table, err)
 	}
 
+	newSchema := ex.sc.FindTableSchema(s.Table)
+	schemaKey := encodeKey(0, newSchema.TableId)
+	schemaFields, _, err := ex.bt.Search(schemaKey)
+	if err != nil {
+		return nil, fmt.Errorf("read schema row for replication: %w", err)
+	}
+	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: schemaKey, Fields: schemaFields})
+
 	return nil, nil
 }
 
@@ -466,9 +474,19 @@ func (ex *Executor) executeDrop(s *DropTableStatement, txnId uint64) (*ResultSet
 		return nil, fmt.Errorf("lock schema key: %w", err)
 	}
 
+	dataRows, err := ex.bt.RangeScan(encodeKey(schema.TableId, 0), encodeKey(schema.TableId, ^uint32(0)))
+	if err != nil {
+		return nil, fmt.Errorf("scan table %q for replication: %w", s.Table, err)
+	}
+
 	if err := ex.sc.DropTable(s.Table); err != nil {
 		return nil, fmt.Errorf("drop table %q: %w", s.Table, err)
 	}
+
+	for _, r := range dataRows {
+		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: r.Key})
+	}
+	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: schemaKey})
 
 	return nil, nil
 }

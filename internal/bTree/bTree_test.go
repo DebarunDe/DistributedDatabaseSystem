@@ -578,6 +578,8 @@ func (m *mockPM) GetRootPageId() uint32                    { return 0 }
 func (m *mockPM) SetRootPageId(_ uint32) error             { return nil }
 func (m *mockPM) Close() error                             { return nil }
 func (m *mockPM) Delete() error                            { return nil }
+func (m *mockPM) GetMetaCheckpointLSN() uint64             { return 0 }
+func (m *mockPM) SetMetaCheckpointLSN(_ uint64) error      { return nil }
 
 // leafPage creates a leaf page with the given ID and pre-inserted keys.
 func leafPage(id uint32, keys []uint64) *pagemanager.Page {
@@ -3669,11 +3671,13 @@ func (p *parentPM) WritePage(pg *pagemanager.Page) error {
 	return nil
 }
 
-func (p *parentPM) FreePage(_ uint32) error       { return nil }
-func (p *parentPM) GetRootPageId() uint32         { return p.rootID }
-func (p *parentPM) SetRootPageId(id uint32) error { p.rootID = id; return nil }
-func (p *parentPM) Close() error                  { return nil }
-func (p *parentPM) Delete() error                 { return nil }
+func (p *parentPM) FreePage(_ uint32) error             { return nil }
+func (p *parentPM) GetRootPageId() uint32               { return p.rootID }
+func (p *parentPM) SetRootPageId(id uint32) error       { p.rootID = id; return nil }
+func (p *parentPM) Close() error                        { return nil }
+func (p *parentPM) Delete() error                       { return nil }
+func (p *parentPM) GetMetaCheckpointLSN() uint64        { return 0 }
+func (p *parentPM) SetMetaCheckpointLSN(_ uint64) error { return nil }
 
 // parentStubPage returns a placeholder page with the given ID.
 // insertIntoParent overwrites its contents immediately, so only the ID matters.
@@ -10991,4 +10995,76 @@ func TestBP_RangeScan_SpansMultiplePages(t *testing.T) {
 	}
 	assertRangeScanKeys(t, results, want)
 	assertRangeScanAscending(t, results)
+}
+
+// ============================================================
+// Checkpoint LSN — BTree + real PageManager stack
+// ============================================================
+
+// GetMetaCheckpointLSN must return 0 on a freshly created BTree store.
+func TestBTree_CheckpointLSN_DefaultZero(t *testing.T) {
+	_, pm := newBPBTree(t, 4)
+
+	if got := pm.GetMetaCheckpointLSN(); got != 0 {
+		t.Errorf("GetMetaCheckpointLSN() on fresh store = %d, want 0", got)
+	}
+}
+
+// BTree Insert operations must not alter the checkpoint LSN.
+func TestBTree_CheckpointLSN_UnaffectedByInsert(t *testing.T) {
+	bt, pm := newBPBTree(t, 4)
+
+	const lsn uint64 = 77
+	if err := pm.SetMetaCheckpointLSN(lsn); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN: %v", err)
+	}
+
+	mustInsert(t, bt, 1, []Field{strF(1, "a")})
+	mustInsert(t, bt, 2, []Field{strF(1, "b")})
+
+	if got := pm.GetMetaCheckpointLSN(); got != lsn {
+		t.Errorf("checkpoint LSN after inserts = %d, want %d", got, lsn)
+	}
+}
+
+// BTree Delete operations must not alter the checkpoint LSN.
+func TestBTree_CheckpointLSN_UnaffectedByDelete(t *testing.T) {
+	bt, pm := newBPBTree(t, 4)
+
+	mustInsert(t, bt, 10, []Field{strF(1, "x")})
+
+	const lsn uint64 = 55
+	if err := pm.SetMetaCheckpointLSN(lsn); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN: %v", err)
+	}
+
+	if err := bt.Delete(10); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if got := pm.GetMetaCheckpointLSN(); got != lsn {
+		t.Errorf("checkpoint LSN after delete = %d, want %d", got, lsn)
+	}
+}
+
+// SetMetaCheckpointLSN must survive Close + OpenDB when backed by a real PageManager.
+func TestBTree_CheckpointLSN_PersistsAcrossReopen(t *testing.T) {
+	bt, pm, path := newBPBTreeForDurability(t, 4)
+
+	mustInsert(t, bt, 1, []Field{strF(1, "v")})
+
+	const lsn uint64 = 12345
+	if err := pm.SetMetaCheckpointLSN(lsn); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN: %v", err)
+	}
+	if err := pm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, pm2 := openBPBTree(t, path, 4)
+	defer func() { _ = pm2.Close() }()
+
+	if got := pm2.GetMetaCheckpointLSN(); got != lsn {
+		t.Errorf("GetMetaCheckpointLSN() after reopen = %d, want %d", got, lsn)
+	}
 }

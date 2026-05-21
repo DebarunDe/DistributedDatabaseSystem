@@ -21,6 +21,58 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type FieldList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ElemType      uint32                 `protobuf:"varint,1,opt,name=elem_type,json=elemType,proto3" json:"elem_type,omitempty"`
+	Elems         []*FieldValue          `protobuf:"bytes,2,rep,name=elems,proto3" json:"elems,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FieldList) Reset() {
+	*x = FieldList{}
+	mi := &file_proto_repl_repl_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FieldList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FieldList) ProtoMessage() {}
+
+func (x *FieldList) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_repl_repl_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FieldList.ProtoReflect.Descriptor instead.
+func (*FieldList) Descriptor() ([]byte, []int) {
+	return file_proto_repl_repl_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *FieldList) GetElemType() uint32 {
+	if x != nil {
+		return x.ElemType
+	}
+	return 0
+}
+
+func (x *FieldList) GetElems() []*FieldValue {
+	if x != nil {
+		return x.Elems
+	}
+	return nil
+}
+
 type FieldValue struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Value:
@@ -28,6 +80,7 @@ type FieldValue struct {
 	//	*FieldValue_IntValue
 	//	*FieldValue_StringValue
 	//	*FieldValue_BoolValue
+	//	*FieldValue_ListValue
 	Value         isFieldValue_Value `protobuf_oneof:"value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -35,7 +88,7 @@ type FieldValue struct {
 
 func (x *FieldValue) Reset() {
 	*x = FieldValue{}
-	mi := &file_proto_repl_repl_proto_msgTypes[0]
+	mi := &file_proto_repl_repl_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -47,7 +100,7 @@ func (x *FieldValue) String() string {
 func (*FieldValue) ProtoMessage() {}
 
 func (x *FieldValue) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_repl_repl_proto_msgTypes[0]
+	mi := &file_proto_repl_repl_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -60,7 +113,7 @@ func (x *FieldValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FieldValue.ProtoReflect.Descriptor instead.
 func (*FieldValue) Descriptor() ([]byte, []int) {
-	return file_proto_repl_repl_proto_rawDescGZIP(), []int{0}
+	return file_proto_repl_repl_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *FieldValue) GetValue() isFieldValue_Value {
@@ -97,6 +150,15 @@ func (x *FieldValue) GetBoolValue() bool {
 	return false
 }
 
+func (x *FieldValue) GetListValue() *FieldList {
+	if x != nil {
+		if x, ok := x.Value.(*FieldValue_ListValue); ok {
+			return x.ListValue
+		}
+	}
+	return nil
+}
+
 type isFieldValue_Value interface {
 	isFieldValue_Value()
 }
@@ -113,11 +175,17 @@ type FieldValue_BoolValue struct {
 	BoolValue bool `protobuf:"varint,3,opt,name=bool_value,json=boolValue,proto3,oneof"`
 }
 
+type FieldValue_ListValue struct {
+	ListValue *FieldList `protobuf:"bytes,4,opt,name=list_value,json=listValue,proto3,oneof"`
+}
+
 func (*FieldValue_IntValue) isFieldValue_Value() {}
 
 func (*FieldValue_StringValue) isFieldValue_Value() {}
 
 func (*FieldValue_BoolValue) isFieldValue_Value() {}
+
+func (*FieldValue_ListValue) isFieldValue_Value() {}
 
 type ReplicationLogEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -131,7 +199,7 @@ type ReplicationLogEntry struct {
 
 func (x *ReplicationLogEntry) Reset() {
 	*x = ReplicationLogEntry{}
-	mi := &file_proto_repl_repl_proto_msgTypes[1]
+	mi := &file_proto_repl_repl_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -143,7 +211,7 @@ func (x *ReplicationLogEntry) String() string {
 func (*ReplicationLogEntry) ProtoMessage() {}
 
 func (x *ReplicationLogEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_repl_repl_proto_msgTypes[1]
+	mi := &file_proto_repl_repl_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -156,7 +224,7 @@ func (x *ReplicationLogEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationLogEntry.ProtoReflect.Descriptor instead.
 func (*ReplicationLogEntry) Descriptor() ([]byte, []int) {
-	return file_proto_repl_repl_proto_rawDescGZIP(), []int{1}
+	return file_proto_repl_repl_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ReplicationLogEntry) GetLsn() uint64 {
@@ -196,7 +264,7 @@ type PullRequest struct {
 
 func (x *PullRequest) Reset() {
 	*x = PullRequest{}
-	mi := &file_proto_repl_repl_proto_msgTypes[2]
+	mi := &file_proto_repl_repl_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -208,7 +276,7 @@ func (x *PullRequest) String() string {
 func (*PullRequest) ProtoMessage() {}
 
 func (x *PullRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_repl_repl_proto_msgTypes[2]
+	mi := &file_proto_repl_repl_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -221,7 +289,7 @@ func (x *PullRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullRequest.ProtoReflect.Descriptor instead.
 func (*PullRequest) Descriptor() ([]byte, []int) {
-	return file_proto_repl_repl_proto_rawDescGZIP(), []int{2}
+	return file_proto_repl_repl_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *PullRequest) GetStartLsn() uint64 {
@@ -240,7 +308,7 @@ type PullResponse struct {
 
 func (x *PullResponse) Reset() {
 	*x = PullResponse{}
-	mi := &file_proto_repl_repl_proto_msgTypes[3]
+	mi := &file_proto_repl_repl_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -252,7 +320,7 @@ func (x *PullResponse) String() string {
 func (*PullResponse) ProtoMessage() {}
 
 func (x *PullResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_repl_repl_proto_msgTypes[3]
+	mi := &file_proto_repl_repl_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -265,7 +333,7 @@ func (x *PullResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullResponse.ProtoReflect.Descriptor instead.
 func (*PullResponse) Descriptor() ([]byte, []int) {
-	return file_proto_repl_repl_proto_rawDescGZIP(), []int{3}
+	return file_proto_repl_repl_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *PullResponse) GetEntries() []*ReplicationLogEntry {
@@ -279,13 +347,18 @@ var File_proto_repl_repl_proto protoreflect.FileDescriptor
 
 const file_proto_repl_repl_proto_rawDesc = "" +
 	"\n" +
-	"\x15proto/repl/repl.proto\x12\vreplication\"z\n" +
+	"\x15proto/repl/repl.proto\x12\vreplication\"W\n" +
+	"\tFieldList\x12\x1b\n" +
+	"\telem_type\x18\x01 \x01(\rR\belemType\x12-\n" +
+	"\x05elems\x18\x02 \x03(\v2\x17.replication.FieldValueR\x05elems\"\xb3\x01\n" +
 	"\n" +
 	"FieldValue\x12\x1d\n" +
 	"\tint_value\x18\x01 \x01(\x03H\x00R\bintValue\x12#\n" +
 	"\fstring_value\x18\x02 \x01(\tH\x00R\vstringValue\x12\x1f\n" +
 	"\n" +
-	"bool_value\x18\x03 \x01(\bH\x00R\tboolValueB\a\n" +
+	"bool_value\x18\x03 \x01(\bH\x00R\tboolValue\x127\n" +
+	"\n" +
+	"list_value\x18\x04 \x01(\v2\x16.replication.FieldListH\x00R\tlistValueB\a\n" +
 	"\x05value\"z\n" +
 	"\x13ReplicationLogEntry\x12\x10\n" +
 	"\x03lsn\x18\x01 \x01(\x04R\x03lsn\x12\x0e\n" +
@@ -311,23 +384,26 @@ func file_proto_repl_repl_proto_rawDescGZIP() []byte {
 	return file_proto_repl_repl_proto_rawDescData
 }
 
-var file_proto_repl_repl_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_proto_repl_repl_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_proto_repl_repl_proto_goTypes = []any{
-	(*FieldValue)(nil),          // 0: replication.FieldValue
-	(*ReplicationLogEntry)(nil), // 1: replication.ReplicationLogEntry
-	(*PullRequest)(nil),         // 2: replication.PullRequest
-	(*PullResponse)(nil),        // 3: replication.PullResponse
+	(*FieldList)(nil),           // 0: replication.FieldList
+	(*FieldValue)(nil),          // 1: replication.FieldValue
+	(*ReplicationLogEntry)(nil), // 2: replication.ReplicationLogEntry
+	(*PullRequest)(nil),         // 3: replication.PullRequest
+	(*PullResponse)(nil),        // 4: replication.PullResponse
 }
 var file_proto_repl_repl_proto_depIdxs = []int32{
-	0, // 0: replication.ReplicationLogEntry.fields:type_name -> replication.FieldValue
-	1, // 1: replication.PullResponse.entries:type_name -> replication.ReplicationLogEntry
-	2, // 2: replication.ReplicationService.StreamUpdates:input_type -> replication.PullRequest
-	3, // 3: replication.ReplicationService.StreamUpdates:output_type -> replication.PullResponse
-	3, // [3:4] is the sub-list for method output_type
-	2, // [2:3] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // 0: replication.FieldList.elems:type_name -> replication.FieldValue
+	0, // 1: replication.FieldValue.list_value:type_name -> replication.FieldList
+	1, // 2: replication.ReplicationLogEntry.fields:type_name -> replication.FieldValue
+	2, // 3: replication.PullResponse.entries:type_name -> replication.ReplicationLogEntry
+	3, // 4: replication.ReplicationService.StreamUpdates:input_type -> replication.PullRequest
+	4, // 5: replication.ReplicationService.StreamUpdates:output_type -> replication.PullResponse
+	5, // [5:6] is the sub-list for method output_type
+	4, // [4:5] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_proto_repl_repl_proto_init() }
@@ -335,10 +411,11 @@ func file_proto_repl_repl_proto_init() {
 	if File_proto_repl_repl_proto != nil {
 		return
 	}
-	file_proto_repl_repl_proto_msgTypes[0].OneofWrappers = []any{
+	file_proto_repl_repl_proto_msgTypes[1].OneofWrappers = []any{
 		(*FieldValue_IntValue)(nil),
 		(*FieldValue_StringValue)(nil),
 		(*FieldValue_BoolValue)(nil),
+		(*FieldValue_ListValue)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -346,7 +423,7 @@ func file_proto_repl_repl_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_repl_repl_proto_rawDesc), len(file_proto_repl_repl_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

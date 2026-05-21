@@ -1560,3 +1560,47 @@ func TestRecoverFromWAL_CrossSession_CrashInSession2_RestoredInSession3(t *testi
 		t.Errorf("WAL not truncated after session 3 recovery: size=%d", info.Size())
 	}
 }
+
+// ============================================================
+// GetMetaCheckpointLSN / SetMetaCheckpointLSN — WAL delegation
+// ============================================================
+
+// GetMetaCheckpointLSN must delegate to the underlying disk and return its value.
+func TestWALImpl_GetMetaCheckpointLSN_DelegatesToDisk(t *testing.T) {
+	const want uint64 = 77
+	spy := newSpyDisk(makePage(1))
+	spy.getCheckpointFn = func() uint64 { return want }
+	wal, _ := newWALImplForTest(t, spy)
+
+	if got := wal.GetMetaCheckpointLSN(); got != want {
+		t.Errorf("GetMetaCheckpointLSN() = %d, want %d", got, want)
+	}
+}
+
+// SetMetaCheckpointLSN must delegate to the underlying disk.
+func TestWALImpl_SetMetaCheckpointLSN_DelegatesToDisk(t *testing.T) {
+	const want uint64 = 55
+	spy := newSpyDisk(makePage(1))
+	wal, _ := newWALImplForTest(t, spy)
+
+	if err := wal.SetMetaCheckpointLSN(want); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN(%d): %v", want, err)
+	}
+	if spy.setCheckpointCount != 1 {
+		t.Errorf("disk.SetMetaCheckpointLSN call count = %d, want 1", spy.setCheckpointCount)
+	}
+	if spy.lastCheckpointSet != want {
+		t.Errorf("disk received lsn = %d, want %d", spy.lastCheckpointSet, want)
+	}
+}
+
+// SetMetaCheckpointLSN must propagate errors from disk.
+func TestWALImpl_SetMetaCheckpointLSN_PropagatesError(t *testing.T) {
+	spy := newSpyDisk(makePage(1))
+	spy.setCheckpointFn = func(_ uint64) error { return errors.New("write failed") }
+	wal, _ := newWALImplForTest(t, spy)
+
+	if err := wal.SetMetaCheckpointLSN(1); err == nil {
+		t.Error("SetMetaCheckpointLSN should propagate disk error")
+	}
+}

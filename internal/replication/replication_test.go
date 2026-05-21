@@ -1,12 +1,19 @@
 package replication
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
+	"net"
 	"os"
 	"strings"
 	"testing"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
+	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	pb "github.com/your-username/DistributedDatabaseSystem/proto/repl"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // ============================================================
@@ -1079,3 +1086,668 @@ func TestScenario_EmptyStringAndZeroInt(t *testing.T) {
 		t.Errorf("empty list: got %d elems", len(lv.Elems))
 	}
 }
+
+// ============================================================
+// ReplicationClient test infrastructure
+// ============================================================
+
+// newTestBTreeForClient creates a fresh BTree + BufferPool in a temp dir.
+func newTestBTreeForClient(t *testing.T) (*btree.BTree, pagemanager.PageManager) {
+	t.Helper()
+	path := t.TempDir() + "/client.db"
+	disk, err := pagemanager.NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	wal, err := pagemanager.NewWAL(disk, path)
+	if err != nil {
+		_ = disk.Close()
+		t.Fatalf("NewWAL: %v", err)
+	}
+	bp := pagemanager.NewBufferPool(wal, 64)
+	t.Cleanup(func() { _ = bp.Close() })
+	return btree.NewBTree(bp), bp
+}
+
+// fakeReplServer is a controllable in-process ReplicationService.
+//
+//   - batches: slices of entries sent as individual PullResponse messages.
+//   - blockAfter: if true, the handler waits for context cancellation after
+//     sending all batches (simulating a live leader); otherwise it returns
+//     immediately so the client stream ends cleanly.
+//   - errAfter: if non-nil, the handler returns this error after batches
+//     (causes a gRPC status error on the client side).
+//   - startLSNSeen: if non-nil, the StartLsn from the first PullRequest is
+//     forwarded into this channel.
+type fakeReplServer struct {
+	pb.UnimplementedReplicationServiceServer
+	batches      [][]*pb.ReplicationLogEntry
+	blockAfter   bool
+	errAfter     error
+	startLSNSeen chan uint64
+}
+
+func (f *fakeReplServer) StreamUpdates(req *pb.PullRequest, stream pb.ReplicationService_StreamUpdatesServer) error {
+	if f.startLSNSeen != nil {
+		select {
+		case f.startLSNSeen <- req.StartLsn:
+		default:
+		}
+	}
+	for _, batch := range f.batches {
+		if err := stream.Send(&pb.PullResponse{Entries: batch}); err != nil {
+			return err
+		}
+	}
+	if f.errAfter != nil {
+		return f.errAfter
+	}
+	if f.blockAfter {
+		<-stream.Context().Done()
+	}
+	return nil
+}
+
+// startFakeServer registers srv on a random local port and returns its address.
+func startFakeServer(t *testing.T, srv pb.ReplicationServiceServer) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterReplicationServiceServer(s, srv)
+	go func() { _ = s.Serve(lis) }()
+	t.Cleanup(s.GracefulStop)
+	return lis.Addr().String()
+}
+
+// runClient starts rc.Start(ctx) in a background goroutine and returns the
+// result channel.  The caller should drain the channel exactly once.
+func runClient(rc *ReplicationClient, ctx context.Context) <-chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- rc.Start(ctx) }()
+	return ch
+}
+
+// errCheckpointPM wraps a real PageManager but always returns a fixed error
+// from SetMetaCheckpointLSN.
+type errCheckpointPM struct {
+	pagemanager.PageManager
+	err error
+}
+
+func (e *errCheckpointPM) SetMetaCheckpointLSN(_ uint64) error { return e.err }
+
+// Proto entry helpers.
+func putEntry(lsn, key uint64, fvs ...*pb.FieldValue) *pb.ReplicationLogEntry {
+	return &pb.ReplicationLogEntry{Lsn: lsn, Op: int32(ReplPut), Key: key, Fields: fvs}
+}
+func delEntry(lsn, key uint64) *pb.ReplicationLogEntry {
+	return &pb.ReplicationLogEntry{Lsn: lsn, Op: int32(ReplDelete), Key: key}
+}
+func intFV(v int64) *pb.FieldValue {
+	return &pb.FieldValue{Value: &pb.FieldValue_IntValue{IntValue: v}}
+}
+func strFV(v string) *pb.FieldValue {
+	return &pb.FieldValue{Value: &pb.FieldValue_StringValue{StringValue: v}}
+}
+
+// mustSearch asserts that key exists in bt and returns its fields.
+func mustSearch(t *testing.T, bt *btree.BTree, key uint64) []btree.Field {
+	t.Helper()
+	fields, found, err := bt.Search(key)
+	if err != nil {
+		t.Fatalf("Search(%d): %v", key, err)
+	}
+	if !found {
+		t.Fatalf("key %d not found in btree", key)
+	}
+	return fields
+}
+
+// mustAbsent asserts that key is absent from bt.
+func mustAbsent(t *testing.T, bt *btree.BTree, key uint64) {
+	t.Helper()
+	_, found, err := bt.Search(key)
+	if err != nil {
+		t.Fatalf("Search(%d): %v", key, err)
+	}
+	if found {
+		t.Fatalf("key %d should be absent but was found", key)
+	}
+}
+
+// ============================================================
+// protoToField
+// ============================================================
+
+func TestProtoToField_IntValue(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_IntValue{IntValue: 42}}, 3)
+	if f.Tag != 3 {
+		t.Errorf("Tag: got %d, want 3", f.Tag)
+	}
+	v, ok := f.Value.(btree.IntValue)
+	if !ok {
+		t.Fatalf("Value type: got %T, want IntValue", f.Value)
+	}
+	if v.V != 42 {
+		t.Errorf("V: got %d, want 42", v.V)
+	}
+}
+
+func TestProtoToField_IntValue_Negative(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_IntValue{IntValue: -999}}, 1)
+	v := f.Value.(btree.IntValue)
+	if v.V != -999 {
+		t.Errorf("V: got %d, want -999", v.V)
+	}
+}
+
+func TestProtoToField_StringValue(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_StringValue{StringValue: "hello"}}, 2)
+	v, ok := f.Value.(btree.StringValue)
+	if !ok {
+		t.Fatalf("Value type: got %T, want StringValue", f.Value)
+	}
+	if v.V != "hello" {
+		t.Errorf("V: got %q, want 'hello'", v.V)
+	}
+}
+
+func TestProtoToField_StringValue_Empty(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_StringValue{StringValue: ""}}, 1)
+	v := f.Value.(btree.StringValue)
+	if v.V != "" {
+		t.Errorf("expected empty string, got %q", v.V)
+	}
+}
+
+func TestProtoToField_BoolValue_True(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_BoolValue{BoolValue: true}}, 1)
+	v, ok := f.Value.(btree.StringValue)
+	if !ok {
+		t.Fatalf("bool true: got %T, want StringValue", f.Value)
+	}
+	if v.V != "TRUE" {
+		t.Errorf("bool true: got %q, want 'TRUE'", v.V)
+	}
+}
+
+func TestProtoToField_BoolValue_False(t *testing.T) {
+	f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_BoolValue{BoolValue: false}}, 1)
+	v := f.Value.(btree.StringValue)
+	if v.V != "FALSE" {
+		t.Errorf("bool false: got %q, want 'FALSE'", v.V)
+	}
+}
+
+func TestProtoToField_ListValue_WithElements(t *testing.T) {
+	f := protoToField(&pb.FieldValue{
+		Value: &pb.FieldValue_ListValue{ListValue: &pb.FieldList{
+			ElemType: uint32(btree.FieldTypeInt),
+			Elems:    []*pb.FieldValue{intFV(10), intFV(20)},
+		}},
+	}, 5)
+	lv, ok := f.Value.(btree.ListValue)
+	if !ok {
+		t.Fatalf("Value type: got %T, want ListValue", f.Value)
+	}
+	if lv.ElemType != btree.FieldTypeInt {
+		t.Errorf("ElemType: got %d, want FieldTypeInt", lv.ElemType)
+	}
+	if len(lv.Elems) != 2 {
+		t.Fatalf("Elems: want 2, got %d", len(lv.Elems))
+	}
+	if lv.Elems[0].(btree.IntValue).V != 10 {
+		t.Errorf("Elems[0]: want 10, got %v", lv.Elems[0])
+	}
+	if lv.Elems[1].(btree.IntValue).V != 20 {
+		t.Errorf("Elems[1]: want 20, got %v", lv.Elems[1])
+	}
+}
+
+func TestProtoToField_ListValue_Empty(t *testing.T) {
+	f := protoToField(&pb.FieldValue{
+		Value: &pb.FieldValue_ListValue{ListValue: &pb.FieldList{
+			ElemType: uint32(btree.FieldTypeString),
+			Elems:    nil,
+		}},
+	}, 2)
+	lv := f.Value.(btree.ListValue)
+	if len(lv.Elems) != 0 {
+		t.Errorf("empty list: want 0 elems, got %d", len(lv.Elems))
+	}
+}
+
+func TestProtoToField_NilValue_ReturnsNullField(t *testing.T) {
+	f := protoToField(&pb.FieldValue{}, 7)
+	if _, ok := f.Value.(btree.NullValue); !ok {
+		t.Errorf("nil oneof: got %T, want NullValue", f.Value)
+	}
+	if f.Tag != 7 {
+		t.Errorf("Tag: got %d, want 7", f.Tag)
+	}
+}
+
+func TestProtoToField_TagPreserved(t *testing.T) {
+	for _, tag := range []uint8{0, 1, 10, 255} {
+		f := protoToField(&pb.FieldValue{Value: &pb.FieldValue_IntValue{}}, tag)
+		if f.Tag != tag {
+			t.Errorf("tag %d round-trip: got %d", tag, f.Tag)
+		}
+	}
+}
+
+// ============================================================
+// NewReplicationClient
+// ============================================================
+
+func TestNewReplicationClient_LastAppliedLSN(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	rc := NewReplicationClient(bt, pm, 42, "localhost:9", nil)
+	if rc.lastAppliedLSN != 42 {
+		t.Errorf("lastAppliedLSN: got %d, want 42", rc.lastAppliedLSN)
+	}
+}
+
+func TestNewReplicationClient_LeaderAddr(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	rc := NewReplicationClient(bt, pm, 0, "leader:5556", nil)
+	if rc.leaderAddr != "leader:5556" {
+		t.Errorf("leaderAddr: got %q, want 'leader:5556'", rc.leaderAddr)
+	}
+}
+
+func TestNewReplicationClient_NilOnBatchAllowed(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	rc := NewReplicationClient(bt, pm, 0, "x:1", nil)
+	if rc.onBatch != nil {
+		t.Error("onBatch should be nil when nil is passed")
+	}
+}
+
+// ============================================================
+// ReplicationClient.Start
+// ============================================================
+
+func TestClientStart_AppliesPutEntry(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{putEntry(0, 42, intFV(100))}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	fields := mustSearch(t, bt, 42)
+	if fields[0].Value.(btree.IntValue).V != 100 {
+		t.Errorf("field 0: got %v, want IntValue{100}", fields[0].Value)
+	}
+}
+
+func TestClientStart_AppliesDeleteEntry(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	// pre-insert the key so there is something to delete
+	if err := bt.Insert(55, []btree.Field{{Tag: 1, Value: btree.IntValue{V: 1}}}); err != nil {
+		t.Fatalf("pre-insert: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{delEntry(0, 55)}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	mustAbsent(t, bt, 55)
+}
+
+func TestClientStart_MultiplePutsInOneBatch(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := []*pb.ReplicationLogEntry{
+		putEntry(0, 10, intFV(1)),
+		putEntry(1, 20, intFV(2)),
+		putEntry(2, 30, intFV(3)),
+	}
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{batch}, blockAfter: true}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	mustSearch(t, bt, 10)
+	mustSearch(t, bt, 20)
+	mustSearch(t, bt, 30)
+}
+
+func TestClientStart_MultipleBatches(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	received := make(chan struct{}, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches: [][]*pb.ReplicationLogEntry{
+			{putEntry(0, 100, intFV(1))},
+			{putEntry(1, 200, intFV(2))},
+		},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error {
+		received <- struct{}{}
+		return nil
+	})
+	errCh := runClient(rc, ctx)
+
+	<-received // batch 1 applied
+	<-received // batch 2 applied
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	mustSearch(t, bt, 100)
+	mustSearch(t, bt, 200)
+}
+
+func TestClientStart_AdvancesLastAppliedLSNPerEntry(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := []*pb.ReplicationLogEntry{
+		putEntry(0, 10, intFV(1)),
+		putEntry(1, 20, intFV(2)),
+		putEntry(2, 30, intFV(3)),
+	}
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{batch}, blockAfter: true}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// after applying entries with LSNs 0,1,2 the next expected LSN is 3
+	if rc.lastAppliedLSN != 3 {
+		t.Errorf("lastAppliedLSN: got %d, want 3", rc.lastAppliedLSN)
+	}
+}
+
+func TestClientStart_CheckpointSavedAfterSingleBatch(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{putEntry(0, 1, intFV(1))}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// after Start returns all writes including SetMetaCheckpointLSN are done
+	if got := pm.GetMetaCheckpointLSN(); got != 1 {
+		t.Errorf("checkpoint after batch: got %d, want 1", got)
+	}
+}
+
+func TestClientStart_CheckpointSavedAfterMultipleBatches(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	received := make(chan struct{}, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches: [][]*pb.ReplicationLogEntry{
+			{putEntry(0, 1, intFV(1))},
+			{putEntry(1, 2, intFV(2))},
+		},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error {
+		received <- struct{}{}
+		return nil
+	})
+	errCh := runClient(rc, ctx)
+
+	<-received
+	<-received
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// checkpoint reflects both batches: LSN 0 and LSN 1 applied → next = 2
+	if got := pm.GetMetaCheckpointLSN(); got != 2 {
+		t.Errorf("checkpoint after 2 batches: got %d, want 2", got)
+	}
+}
+
+func TestClientStart_CallsOnBatchAfterEachBatch(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	received := make(chan struct{}, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches: [][]*pb.ReplicationLogEntry{
+			{putEntry(0, 1, intFV(1))},
+			{putEntry(1, 2, intFV(2))},
+			{putEntry(2, 3, intFV(3))},
+		},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error {
+		received <- struct{}{}
+		return nil
+	})
+	errCh := runClient(rc, ctx)
+
+	for i := 0; i < 3; i++ {
+		<-received
+	}
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+func TestClientStart_NilOnBatchSucceeds(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	// server closes the stream after sending — Start returns EOF error; that's fine
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{{putEntry(0, 7, intFV(7))}}}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, nil)
+	// must not panic; any error is acceptable
+	_ = rc.Start(context.Background())
+	mustSearch(t, bt, 7)
+}
+
+func TestClientStart_ContextCancellationReturnsNil(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	seen := make(chan uint64, 1)
+	// server blocks after receiving the request; client cancels once connected
+	fake := &fakeReplServer{blockAfter: true, startLSNSeen: seen}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, nil)
+	errCh := runClient(rc, ctx)
+	<-seen // stream established — cancel now so the nil-return path is exercised
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Start after ctx cancel: want nil, got %v", err)
+	}
+}
+
+func TestClientStart_StreamErrorReturnsError(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	fake := &fakeReplServer{errAfter: errors.New("server exploded")}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, nil)
+	if err := rc.Start(context.Background()); err == nil {
+		t.Error("Start: expected error from stream failure, got nil")
+	}
+}
+
+func TestClientStart_OnBatchErrorPropagates(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	boom := errors.New("batch callback failed")
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{putEntry(0, 1, intFV(1))}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { return boom })
+	if err := rc.Start(context.Background()); err == nil {
+		t.Error("Start: expected onBatch error to propagate, got nil")
+	}
+}
+
+func TestClientStart_SetMetaCheckpointLSNErrorPropagates(t *testing.T) {
+	bt, realPM := newTestBTreeForClient(t)
+	pm := &errCheckpointPM{PageManager: realPM, err: errors.New("disk full")}
+	// server sends 1 batch and closes — SetMetaCheckpointLSN runs before EOF recv
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{{putEntry(0, 1, intFV(1))}}}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, nil)
+	if err := rc.Start(context.Background()); err == nil {
+		t.Error("Start: expected checkpoint error to propagate, got nil")
+	}
+}
+
+func TestClientStart_StartLSNPassedToServer(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	seen := make(chan uint64, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{blockAfter: true, startLSNSeen: seen}
+	addr := startFakeServer(t, fake)
+	const startLSN uint64 = 77
+	rc := NewReplicationClient(bt, pm, startLSN, addr, nil)
+	errCh := runClient(rc, ctx)
+	// wait for the stream to be established before cancelling
+	got := <-seen
+	cancel()
+	<-errCh
+
+	if got != startLSN {
+		t.Errorf("PullRequest.StartLsn: got %d, want %d", got, startLSN)
+	}
+}
+
+func TestClientStart_FieldsCorrectlyApplied(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+
+	boolField := &pb.FieldValue{Value: &pb.FieldValue_BoolValue{BoolValue: true}}
+	listField := &pb.FieldValue{Value: &pb.FieldValue_ListValue{ListValue: &pb.FieldList{
+		ElemType: uint32(btree.FieldTypeInt),
+		Elems:    []*pb.FieldValue{intFV(1), intFV(2)},
+	}}}
+	batch := []*pb.ReplicationLogEntry{
+		putEntry(0, 99, intFV(-5), strFV("name"), boolField, listField),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{batch}, blockAfter: true}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	fields := mustSearch(t, bt, 99)
+	if len(fields) != 4 {
+		t.Fatalf("fields: want 4, got %d", len(fields))
+	}
+	if fields[0].Value.(btree.IntValue).V != -5 {
+		t.Errorf("field 0 (int): got %v", fields[0].Value)
+	}
+	if fields[1].Value.(btree.StringValue).V != "name" {
+		t.Errorf("field 1 (string): got %v", fields[1].Value)
+	}
+	if fields[2].Value.(btree.StringValue).V != "TRUE" {
+		t.Errorf("field 2 (bool): got %v", fields[2].Value)
+	}
+	lv := fields[3].Value.(btree.ListValue)
+	if len(lv.Elems) != 2 {
+		t.Errorf("field 3 (list): want 2 elems, got %d", len(lv.Elems))
+	}
+}
+
+func TestClientStart_PutOverwritesExistingKey(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	// pre-insert key 5 with value 10
+	if err := bt.Insert(5, []btree.Field{{Tag: 1, Value: btree.IntValue{V: 10}}}); err != nil {
+		t.Fatalf("pre-insert: %v", err)
+	}
+	// replicate a put for the same key with a new value
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{putEntry(0, 5, intFV(99))}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	fields := mustSearch(t, bt, 5)
+	if fields[0].Value.(btree.IntValue).V != 99 {
+		t.Errorf("overwrite: got %v, want IntValue{99}", fields[0].Value)
+	}
+}
+
+func TestClientStart_DeleteNonExistentKeySucceeds(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	// deleting a key that was never inserted must not fail
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{delEntry(0, 999)}},
+		blockAfter: true,
+	}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start on delete of absent key: %v", err)
+	}
+}
+
+func TestClientStart_LargeNumberOfEntries(t *testing.T) {
+	bt, pm := newTestBTreeForClient(t)
+	const n = 200
+	batch := make([]*pb.ReplicationLogEntry, n)
+	for i := range batch {
+		batch[i] = putEntry(uint64(i), uint64(i+1000), intFV(int64(i)))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{batch}, blockAfter: true}
+	addr := startFakeServer(t, fake)
+	rc := NewReplicationClient(bt, pm, 0, addr, func() error { cancel(); return nil })
+	if err := <-runClient(rc, ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if rc.lastAppliedLSN != n {
+		t.Errorf("lastAppliedLSN: got %d, want %d", rc.lastAppliedLSN, n)
+	}
+	for i := 0; i < n; i++ {
+		mustSearch(t, bt, uint64(i+1000))
+	}
+}
+
+// insecure is only referenced via the grpc.WithTransportCredentials call inside
+// ReplicationClient.Start itself; the import satisfies the compiler.
+var _ = insecure.NewCredentials
