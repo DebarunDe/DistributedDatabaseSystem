@@ -7,6 +7,7 @@ import (
 
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
+	"github.com/your-username/DistributedDatabaseSystem/internal/replication"
 )
 
 type ResultRow struct {
@@ -246,6 +247,7 @@ func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet,
 	}
 
 	ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoInsert, Key: encodedKey, Fields: nil})
+	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: encodedKey, Fields: fields})
 
 	return nil, nil
 }
@@ -377,6 +379,10 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 		if err := ex.bt.Insert(r.Key, fields); err != nil {
 			return nil, fmt.Errorf("update failed for key %d: %w", r.Key, err)
 		}
+
+		newFields := make([]btree.Field, len(fields))
+		copy(newFields, fields)
+		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: r.Key, Fields: newFields})
 	}
 
 	return nil, nil
@@ -413,6 +419,7 @@ func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet,
 		oldFields := make([]btree.Field, len(fields))
 		copy(oldFields, fields)
 		ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoDelete, Key: r.Key, Fields: oldFields})
+		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: r.Key, Fields: nil})
 
 		if err := ex.bt.Delete(r.Key); err != nil {
 			return nil, fmt.Errorf("delete on key %d: %w", r.Key, err)
@@ -444,6 +451,14 @@ func (ex *Executor) executeCreate(s *CreateTableStatement, txnId uint64) (*Resul
 		return nil, fmt.Errorf("create table %q: %w", s.Table, err)
 	}
 
+	newSchema := ex.sc.FindTableSchema(s.Table)
+	schemaKey := encodeKey(0, newSchema.TableId)
+	schemaFields, _, err := ex.bt.Search(schemaKey)
+	if err != nil {
+		return nil, fmt.Errorf("read schema row for replication: %w", err)
+	}
+	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: schemaKey, Fields: schemaFields})
+
 	return nil, nil
 }
 
@@ -459,9 +474,19 @@ func (ex *Executor) executeDrop(s *DropTableStatement, txnId uint64) (*ResultSet
 		return nil, fmt.Errorf("lock schema key: %w", err)
 	}
 
+	dataRows, err := ex.bt.RangeScan(encodeKey(schema.TableId, 0), encodeKey(schema.TableId, ^uint32(0)))
+	if err != nil {
+		return nil, fmt.Errorf("scan table %q for replication: %w", s.Table, err)
+	}
+
 	if err := ex.sc.DropTable(s.Table); err != nil {
 		return nil, fmt.Errorf("drop table %q: %w", s.Table, err)
 	}
+
+	for _, r := range dataRows {
+		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: r.Key})
+	}
+	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: schemaKey})
 
 	return nil, nil
 }

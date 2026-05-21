@@ -1,0 +1,37 @@
+syntax = "proto3";
+package replication;
+
+option go_package = "github.com/your-username/DistributedDatabaseSystem/proto/replication";
+
+message FieldList {
+    uint32 elem_type = 1;
+    repeated FieldValue elems = 2;
+}
+
+message FieldValue {
+    oneof value {
+        int64 int_value = 1;
+        string string_value = 2;
+        bool bool_value = 3;
+        FieldList list_value = 4;
+    }
+}
+
+message ReplicationLogEntry {
+    uint64 lsn = 1;
+    int32 op = 2;
+    uint64 key = 3;
+    repeated FieldValue fields = 4;
+}
+
+message PullRequest {
+    uint64 start_lsn = 1;
+}
+
+message PullResponse {
+    repeated ReplicationLogEntry entries = 1;
+}
+
+service ReplicationService {
+    rpc StreamUpdates(PullRequest) returns (stream PullResponse);
+}

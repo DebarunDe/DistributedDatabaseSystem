@@ -820,6 +820,74 @@ func TestAllocatePage_NoDuplicateIDs(t *testing.T) {
 	}
 }
 
+// ============================================================
+// GetMetaCheckpointLSN / SetMetaCheckpointLSN — PageManagerImpl
+// ============================================================
+
+// GetMetaCheckpointLSN must return 0 on a freshly created database.
+func TestGetMetaCheckpointLSN_Default(t *testing.T) {
+	path := newTempPath(t)
+	pm := mustNewDB(t, path)
+	defer func() { _ = pm.Close() }()
+
+	if got := pm.GetMetaCheckpointLSN(); got != 0 {
+		t.Errorf("GetMetaCheckpointLSN() on fresh db = %d, want 0", got)
+	}
+}
+
+// SetMetaCheckpointLSN must be visible via GetMetaCheckpointLSN within the same session.
+func TestSetMetaCheckpointLSN_InMemory(t *testing.T) {
+	path := newTempPath(t)
+	pm := mustNewDB(t, path)
+	defer func() { _ = pm.Close() }()
+
+	const want uint64 = 1234
+	if err := pm.SetMetaCheckpointLSN(want); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN(%d): %v", want, err)
+	}
+	if got := pm.GetMetaCheckpointLSN(); got != want {
+		t.Errorf("GetMetaCheckpointLSN() = %d, want %d", got, want)
+	}
+}
+
+// SetMetaCheckpointLSN must persist across Close + OpenDB.
+func TestSetMetaCheckpointLSN_Persistence(t *testing.T) {
+	path := newTempPath(t)
+
+	pm, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	const want uint64 = 9999
+	if err := pm.SetMetaCheckpointLSN(want); err != nil {
+		t.Fatalf("SetMetaCheckpointLSN(%d): %v", want, err)
+	}
+	mustClose(t, pm)
+
+	pm2 := mustOpenDB(t, path)
+	defer func() { _ = pm2.Close() }()
+
+	if got := pm2.GetMetaCheckpointLSN(); got != want {
+		t.Errorf("GetMetaCheckpointLSN() after reopen = %d, want %d", got, want)
+	}
+}
+
+// Multiple SetMetaCheckpointLSN calls must overwrite to the latest value.
+func TestSetMetaCheckpointLSN_Overwrite(t *testing.T) {
+	path := newTempPath(t)
+	pm := mustNewDB(t, path)
+	defer func() { _ = pm.Close() }()
+
+	for _, lsn := range []uint64{1, 50, 1000, 0} {
+		if err := pm.SetMetaCheckpointLSN(lsn); err != nil {
+			t.Fatalf("SetMetaCheckpointLSN(%d): %v", lsn, err)
+		}
+		if got := pm.GetMetaCheckpointLSN(); got != lsn {
+			t.Errorf("GetMetaCheckpointLSN() = %d, want %d", got, lsn)
+		}
+	}
+}
+
 // FreePage then AllocatePage must not increase the total page count.
 func TestFreePage_ReuseDoesNotInflatePageCount(t *testing.T) {
 	path := newTempPath(t)

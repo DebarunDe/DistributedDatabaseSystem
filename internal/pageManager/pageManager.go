@@ -15,6 +15,8 @@ type PageManager interface {
 	FreePage(pageId uint32) error
 	GetRootPageId() uint32
 	SetRootPageId(pageId uint32) error
+	GetMetaCheckpointLSN() uint64
+	SetMetaCheckpointLSN(lsn uint64) error
 	Close() error
 	Delete() error
 }
@@ -446,6 +448,49 @@ func (wal *WALImpl) SetRootPageId(pageId uint32) error {
 	// The root page ID is stored in the meta page, which is managed by the disk layer. We can update it directly on the disk.
 	if err := wal.disk.SetRootPageId(pageId); err != nil {
 		return fmt.Errorf("failed to set root page id on disk: %w", err)
+	}
+
+	return nil
+}
+
+// GetMetaCheckpointLSN returns the checkpoint LSN stored in the meta page.
+func (pm *PageManagerImpl) GetMetaCheckpointLSN() uint64 {
+	return pm.metaPage.GetMetaCheckpoint()
+}
+
+func (bp *BufferPoolImpl) GetMetaCheckpointLSN() uint64 {
+	return bp.disk.GetMetaCheckpointLSN()
+}
+
+func (wal *WALImpl) GetMetaCheckpointLSN() uint64 {
+	return wal.disk.GetMetaCheckpointLSN()
+}
+
+// setMetaCheckpointLSN sets the checkpoint LSN in the meta page.
+func (pm *PageManagerImpl) SetMetaCheckpointLSN(lsn uint64) error {
+	if pm.file == nil {
+		return fmt.Errorf("page manager is closed")
+	}
+
+	pm.metaPage.setMetaCheckpoint(lsn)
+	if err := pm.WritePage(pm.metaPage); err != nil {
+		return fmt.Errorf("failed to write meta page: %w", err)
+	}
+
+	return nil
+}
+
+func (bp *BufferPoolImpl) SetMetaCheckpointLSN(lsn uint64) error {
+	if err := bp.disk.SetMetaCheckpointLSN(lsn); err != nil {
+		return fmt.Errorf("failed to set meta checkpoint LSN on disk: %w", err)
+	}
+
+	return nil
+}
+
+func (wal *WALImpl) SetMetaCheckpointLSN(lsn uint64) error {
+	if err := wal.disk.SetMetaCheckpointLSN(lsn); err != nil {
+		return fmt.Errorf("failed to set meta checkpoint LSN on disk: %w", err)
 	}
 
 	return nil
