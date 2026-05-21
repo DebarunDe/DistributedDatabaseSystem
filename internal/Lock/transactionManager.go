@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"log"
 	"slices"
 	"sync"
 
@@ -131,11 +132,17 @@ func (tm *TransactionManager) Rollback(txnId uint64) {
 	for _, entry := range slices.Backward(undoLog) {
 		switch entry.Op {
 		case UndoInsert:
-			_ = tm.bt.Delete(entry.Key)
+			if err := tm.bt.Delete(entry.Key); err != nil {
+				log.Printf("rollback: undo insert for key %d: %v", entry.Key, err)
+			}
 		case UndoDelete:
-			_ = tm.bt.Insert(entry.Key, entry.Fields)
+			if err := tm.bt.Insert(entry.Key, entry.Fields); err != nil {
+				log.Printf("rollback: undo delete for key %d: %v", entry.Key, err)
+			}
 		case UndoUpdate:
-			_ = tm.bt.Insert(entry.Key, entry.Fields)
+			if err := tm.bt.Insert(entry.Key, entry.Fields); err != nil {
+				log.Printf("rollback: undo update for key %d: %v", entry.Key, err)
+			}
 		}
 	}
 

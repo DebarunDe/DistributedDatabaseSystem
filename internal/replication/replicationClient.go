@@ -3,6 +3,8 @@ package replication
 import (
 	"context"
 	"fmt"
+	"log"
+	"time"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
@@ -56,15 +58,42 @@ func protoToField(fv *pb.FieldValue, tag uint8) btree.Field {
 }
 
 func (rc *ReplicationClient) Start(ctx context.Context) error {
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := rc.runOnce(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("replication client: %v; reconnecting in %v", err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil
+			}
+			if backoff < maxBackoff/2 {
+				backoff *= 2
+			} else {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func (rc *ReplicationClient) runOnce(ctx context.Context) error {
 	conn, err := grpc.NewClient(rc.leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("replication client: dial %s: %w", rc.leaderAddr, err)
+		return fmt.Errorf("dial %s: %w", rc.leaderAddr, err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	stream, err := pb.NewReplicationServiceClient(conn).StreamUpdates(ctx, &pb.PullRequest{StartLsn: rc.lastAppliedLSN})
 	if err != nil {
-		return fmt.Errorf("replication client: stream updates: %w", err)
+		return fmt.Errorf("stream updates: %w", err)
 	}
 
 	for {
@@ -73,7 +102,7 @@ func (rc *ReplicationClient) Start(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("replication client: recv: %w", err)
+			return fmt.Errorf("recv: %w", err)
 		}
 
 		for _, entry := range resp.Entries {
@@ -84,11 +113,11 @@ func (rc *ReplicationClient) Start(ctx context.Context) error {
 			switch ReplOp(entry.Op) {
 			case ReplPut:
 				if err := rc.bt.Insert(entry.Key, fields); err != nil {
-					return fmt.Errorf("replication client: apply insert (lsn=%d): %w", entry.Lsn, err)
+					return fmt.Errorf("apply insert (lsn=%d): %w", entry.Lsn, err)
 				}
 			case ReplDelete:
 				if err := rc.bt.Delete(entry.Key); err != nil {
-					return fmt.Errorf("replication client: apply delete (lsn=%d): %w", entry.Lsn, err)
+					return fmt.Errorf("apply delete (lsn=%d): %w", entry.Lsn, err)
 				}
 			}
 			rc.lastAppliedLSN = entry.Lsn + 1
@@ -96,12 +125,12 @@ func (rc *ReplicationClient) Start(ctx context.Context) error {
 
 		if rc.onBatch != nil {
 			if err := rc.onBatch(); err != nil {
-				return fmt.Errorf("replication client: post-batch: %w", err)
+				return fmt.Errorf("post-batch: %w", err)
 			}
 		}
 
 		if err := rc.pm.SetMetaCheckpointLSN(rc.lastAppliedLSN); err != nil {
-			return fmt.Errorf("replication client: checkpoint lsn=%d: %w", rc.lastAppliedLSN, err)
+			return fmt.Errorf("checkpoint lsn=%d: %w", rc.lastAppliedLSN, err)
 		}
 	}
 }

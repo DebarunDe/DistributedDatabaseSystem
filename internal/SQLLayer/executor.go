@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
@@ -22,9 +23,15 @@ type ResultSet struct {
 }
 
 type Executor struct {
-	sc *SchemaCatalog
-	bt *btree.BTree
-	tm *lock.TransactionManager
+	sc      *SchemaCatalog
+	bt      *btree.BTree
+	tm      *lock.TransactionManager
+	tableMu sync.Map // uint32 tableId → *sync.RWMutex
+}
+
+func (ex *Executor) getTableMu(tableId uint32) *sync.RWMutex {
+	v, _ := ex.tableMu.LoadOrStore(tableId, &sync.RWMutex{})
+	return v.(*sync.RWMutex)
 }
 
 // Helpers
@@ -196,6 +203,10 @@ func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet,
 		return nil, fmt.Errorf("table %q not found", s.Table)
 	}
 
+	mu := ex.getTableMu(schema.TableId)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if strings.ToUpper(schema.PrimaryKey.DataType) != "INT" {
 		return nil, fmt.Errorf("primary key %q has unsupported type %q: only INT is supported", schema.PrimaryKey.Name, schema.PrimaryKey.DataType)
 	}
@@ -261,6 +272,13 @@ func (ex *Executor) executeSelect(s *SelectStatement, txnId uint64) (*ResultSet,
 
 	tableId := schema.TableId
 
+	// Hold a shared table lock for the duration of the scan + row locking so that
+	// concurrent INSERTs (which take an exclusive table lock) cannot add new rows
+	// between the range scan and the per-row lock acquisitions (phantom prevention).
+	mu := ex.getTableMu(tableId)
+	mu.RLock()
+	defer mu.RUnlock()
+
 	// resolve column indices: "*" expands to PK + all columns
 	var colIndices []int
 	if len(s.Columns) == 1 && s.Columns[0] == "*" {
@@ -325,6 +343,10 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
 	}
+
+	mu := ex.getTableMu(schema.TableId)
+	mu.Lock()
+	defer mu.Unlock()
 
 	columnFound := false
 	for i := range schema.Columns {
@@ -394,6 +416,10 @@ func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet,
 	if schema == nil {
 		return nil, fmt.Errorf("table %q not found", s.Table)
 	}
+
+	mu := ex.getTableMu(schema.TableId)
+	mu.Lock()
+	defer mu.Unlock()
 
 	tableId := schema.TableId
 	results, err := ex.bt.RangeScan(encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)))

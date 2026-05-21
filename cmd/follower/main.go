@@ -50,6 +50,7 @@ func (s *followerServer) Execute(ctx context.Context, req *pb.SQLRequest) (*pb.S
 		return nil, status.Errorf(codes.Internal, "execute: %v", err)
 	}
 	if err := s.tm.Commit(txn.Id); err != nil {
+		s.tm.Rollback(txn.Id)
 		return nil, status.Errorf(codes.Internal, "commit: %v", err)
 	}
 	if result == nil {

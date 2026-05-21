@@ -120,11 +120,13 @@ func (rm *ReplicationManager) appendOne(op ReplOp, key uint64, fields []btree.Fi
 		return 0, fmt.Errorf("Append: writing record: %w", err)
 	}
 
+	// Advance before sync so a sync failure doesn't leave this LSN reusable.
+	rm.nextLSN++
+
 	if err := rm.file.Sync(); err != nil {
 		return 0, fmt.Errorf("Append: syncing file: %w", err)
 	}
 
-	rm.nextLSN++
 	rm.cond.Broadcast()
 	return assignedLSN, nil
 }
