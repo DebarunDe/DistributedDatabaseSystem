@@ -43,42 +43,54 @@ func fieldToProto(f btree.Field) (*pb.FieldValue, error) {
 
 func (rs *ReplicationServer) StreamUpdates(req *pb.PullRequest, stream pb.ReplicationService_StreamUpdatesServer) error {
 	lastSent := req.StartLsn
+	ctx := stream.Context()
+
+	// When the follower disconnects, broadcast so cond.Wait returns immediately
+	// instead of blocking the goroutine until the next log write (goroutine-leak fix).
+	go func() {
+		<-ctx.Done()
+		rs.rm.cond.Broadcast()
+	}()
 
 	for {
-		if stream.Context().Err() != nil {
-			return nil // client disconnected
+		if ctx.Err() != nil {
+			return nil
 		}
 
-		entries, err := rs.rm.ReadFrom(lastSent)
+		// Hold the lock across the read and the wait so that appendOne cannot
+		// broadcast between our "no entries" check and cond.Wait (lost-wakeup fix).
+		rs.rm.mu.Lock()
+		entries, err := rs.rm.readFromLocked(lastSent)
 		if err != nil {
+			rs.rm.mu.Unlock()
 			return fmt.Errorf("StreamUpdates: read from replication log: %w", err)
 		}
-
-		if len(entries) > 0 {
-			pbEntries := make([]*pb.ReplicationLogEntry, len(entries))
-			for i, entry := range entries {
-				fields := make([]*pb.FieldValue, len(entry.Fields))
-				for j, f := range entry.Fields {
-					fields[j], err = fieldToProto(f)
-					if err != nil {
-						return fmt.Errorf("StreamUpdates: %w", err)
-					}
-				}
-				pbEntries[i] = &pb.ReplicationLogEntry{
-					Lsn:    entry.LSN,
-					Op:     int32(entry.Op),
-					Key:    entry.Key,
-					Fields: fields,
-				}
-				lastSent = entry.LSN + 1
-			}
-			if err := stream.Send(&pb.PullResponse{Entries: pbEntries}); err != nil {
-				return fmt.Errorf("StreamUpdates: send to client: %w", err)
-			}
-		} else {
-			rs.rm.mu.Lock()
+		if len(entries) == 0 {
 			rs.rm.cond.Wait()
 			rs.rm.mu.Unlock()
+			continue
+		}
+		rs.rm.mu.Unlock()
+
+		pbEntries := make([]*pb.ReplicationLogEntry, len(entries))
+		for i, entry := range entries {
+			fields := make([]*pb.FieldValue, len(entry.Fields))
+			for j, f := range entry.Fields {
+				fields[j], err = fieldToProto(f)
+				if err != nil {
+					return fmt.Errorf("StreamUpdates: %w", err)
+				}
+			}
+			pbEntries[i] = &pb.ReplicationLogEntry{
+				Lsn:    entry.LSN,
+				Op:     int32(entry.Op),
+				Key:    entry.Key,
+				Fields: fields,
+			}
+			lastSent = entry.LSN + 1
+		}
+		if err := stream.Send(&pb.PullResponse{Entries: pbEntries}); err != nil {
+			return fmt.Errorf("StreamUpdates: send to client: %w", err)
 		}
 	}
 }

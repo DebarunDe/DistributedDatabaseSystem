@@ -144,11 +144,9 @@ func (rm *ReplicationManager) Append(entries []ReplicationLogEntry) error {
 	return nil
 }
 
-// ReadFrom returns all log entries with LSN >= startLSN, scanning the file from the start.
-func (rm *ReplicationManager) ReadFrom(startLSN uint64) ([]ReplicationLogEntry, error) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
+// readFromLocked scans the log for entries with LSN >= startLSN.
+// Caller must hold rm.mu.
+func (rm *ReplicationManager) readFromLocked(startLSN uint64) ([]ReplicationLogEntry, error) {
 	if _, err := rm.file.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("ReadFrom: seek to start: %w", err)
 	}
@@ -190,4 +188,11 @@ func (rm *ReplicationManager) ReadFrom(startLSN uint64) ([]ReplicationLogEntry, 
 	}
 
 	return entries, nil
+}
+
+// ReadFrom returns all log entries with LSN >= startLSN, scanning the file from the start.
+func (rm *ReplicationManager) ReadFrom(startLSN uint64) ([]ReplicationLogEntry, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return rm.readFromLocked(startLSN)
 }

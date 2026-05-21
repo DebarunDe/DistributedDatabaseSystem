@@ -478,6 +478,9 @@ func (ex *Executor) executeCreate(s *CreateTableStatement, txnId uint64) (*Resul
 	}
 
 	newSchema := ex.sc.FindTableSchema(s.Table)
+	if newSchema == nil {
+		return nil, fmt.Errorf("create table %q: schema not found after creation", s.Table)
+	}
 	schemaKey := encodeKey(0, newSchema.TableId)
 	schemaFields, _, err := ex.bt.Search(schemaKey)
 	if err != nil {
