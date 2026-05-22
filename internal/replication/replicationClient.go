@@ -2,7 +2,9 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"time"
 
@@ -10,8 +12,16 @@ import (
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
 	pb "github.com/your-username/DistributedDatabaseSystem/proto/repl"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
+
+// fatalErr wraps an error that should not trigger a reconnect retry.
+type fatalErr struct{ err error }
+
+func (f *fatalErr) Error() string { return f.err.Error() }
+func (f *fatalErr) Unwrap() error { return f.err }
 
 type ReplicationClient struct {
 	bt             *btree.BTree
@@ -66,6 +76,10 @@ func (rc *ReplicationClient) Start(ctx context.Context) error {
 			return nil
 		}
 		if err := rc.runOnce(ctx); err != nil {
+			var fe *fatalErr
+			if errors.As(err, &fe) {
+				return fe.err
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -102,6 +116,19 @@ func (rc *ReplicationClient) runOnce(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("recv: %w", err)
+			}
+			// Explicit gRPC status error (server-side rejection) with a non-transient
+			// code should not be retried — propagate immediately.
+			if s, ok := status.FromError(err); ok {
+				switch s.Code() {
+				case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+					// transient — let the retry loop reconnect
+				default:
+					return &fatalErr{fmt.Errorf("recv: %w", err)}
+				}
+			}
 			return fmt.Errorf("recv: %w", err)
 		}
 
@@ -125,12 +152,12 @@ func (rc *ReplicationClient) runOnce(ctx context.Context) error {
 
 		if rc.onBatch != nil {
 			if err := rc.onBatch(); err != nil {
-				return fmt.Errorf("post-batch: %w", err)
+				return &fatalErr{fmt.Errorf("post-batch: %w", err)}
 			}
 		}
 
 		if err := rc.pm.SetMetaCheckpointLSN(rc.lastAppliedLSN); err != nil {
-			return fmt.Errorf("checkpoint lsn=%d: %w", rc.lastAppliedLSN, err)
+			return &fatalErr{fmt.Errorf("checkpoint lsn=%d: %w", rc.lastAppliedLSN, err)}
 		}
 	}
 }

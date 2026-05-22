@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
@@ -1565,13 +1566,32 @@ func TestClientStart_CallsOnBatchAfterEachBatch(t *testing.T) {
 
 func TestClientStart_NilOnBatchSucceeds(t *testing.T) {
 	bt, pm := newTestBTreeForClient(t)
-	// server closes the stream after sending — Start returns EOF error; that's fine
-	fake := &fakeReplServer{batches: [][]*pb.ReplicationLogEntry{{putEntry(0, 7, intFV(7))}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// blockAfter keeps the stream open so Start stays alive until we cancel.
+	fake := &fakeReplServer{
+		batches:    [][]*pb.ReplicationLogEntry{{putEntry(0, 7, intFV(7))}},
+		blockAfter: true,
+	}
 	addr := startFakeServer(t, fake)
+	// nil onBatch must not panic
 	rc := NewReplicationClient(bt, pm, 0, addr, nil)
-	// must not panic; any error is acceptable
-	_ = rc.Start(context.Background())
+	errCh := runClient(rc, ctx)
+
+	// Poll until the batch is applied, then stop the client.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, found, _ := bt.Search(7)
+		if found {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	mustSearch(t, bt, 7)
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("Start after ctx cancel: want nil, got %v", err)
+	}
 }
 
 func TestClientStart_ContextCancellationReturnsNil(t *testing.T) {
