@@ -8,7 +8,7 @@ import (
 
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
-	"github.com/your-username/DistributedDatabaseSystem/internal/replication"
+	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 )
 
 type ResultRow struct {
@@ -253,12 +253,8 @@ func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet,
 		fields = append(fields, field)
 	}
 
-	if err := ex.bt.Insert(encodedKey, fields); err != nil {
-		return nil, fmt.Errorf("insert failed: %w", err)
-	}
-
-	ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoInsert, Key: encodedKey, Fields: nil})
-	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: encodedKey, Fields: fields})
+	// Buffer the write; the BTree is updated after consensus via applyFn/applyHook.
+	ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplPut, Key: encodedKey, Fields: fields})
 
 	return nil, nil
 }
@@ -384,10 +380,6 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 			continue
 		}
 
-		oldFields := make([]btree.Field, len(fields))
-		copy(oldFields, fields)
-		ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoUpdate, Key: r.Key, Fields: oldFields})
-
 		i := findColumnIndex(s.Column, schema)
 		if i <= 0 {
 			return nil, fmt.Errorf("column %q not found in schema", s.Column)
@@ -396,15 +388,12 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", s.Column, err)
 		}
-		fields[i] = newField
-
-		if err := ex.bt.Insert(r.Key, fields); err != nil {
-			return nil, fmt.Errorf("update failed for key %d: %w", r.Key, err)
-		}
-
 		newFields := make([]btree.Field, len(fields))
 		copy(newFields, fields)
-		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: r.Key, Fields: newFields})
+		newFields[i] = newField
+
+		// Buffer the write; the BTree is updated after consensus via applyFn/applyHook.
+		ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplPut, Key: r.Key, Fields: newFields})
 	}
 
 	return nil, nil
@@ -442,14 +431,8 @@ func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet,
 			continue
 		}
 
-		oldFields := make([]btree.Field, len(fields))
-		copy(oldFields, fields)
-		ex.tm.AppendUndo(txnId, lock.UndoEntry{Op: lock.UndoDelete, Key: r.Key, Fields: oldFields})
-		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: r.Key, Fields: nil})
-
-		if err := ex.bt.Delete(r.Key); err != nil {
-			return nil, fmt.Errorf("delete on key %d: %w", r.Key, err)
-		}
+		// Buffer the delete; the BTree is updated after consensus via applyFn/applyHook.
+		ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplDelete, Key: r.Key})
 	}
 
 	return nil, nil
@@ -457,36 +440,23 @@ func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet,
 
 // executeCreate executes a create statement
 func (ex *Executor) executeCreate(s *CreateTableStatement, txnId uint64) (*ResultSet, error) {
-	schema := ex.sc.FindTableSchema(s.Table)
-	if schema != nil {
-		return nil, fmt.Errorf("table %q already exists", s.Table)
-	}
-
 	pkName := s.Columns[0].Name
 	pkType := s.Columns[0].DataType
 
-	columnNames := []string{}
-	columnTypes := []string{}
-
+	colNames := make([]string, 0, len(s.Columns)-1)
+	colTypes := make([]string, 0, len(s.Columns)-1)
 	for i := range len(s.Columns) - 1 {
-		columnNames = append(columnNames, s.Columns[i+1].Name)
-		columnTypes = append(columnTypes, s.Columns[i+1].DataType)
+		colNames = append(colNames, s.Columns[i+1].Name)
+		colTypes = append(colTypes, s.Columns[i+1].DataType)
 	}
 
-	if err := ex.sc.CreateTable(s.Table, pkName, pkType, columnNames, columnTypes); err != nil {
+	// Reserve the table ID and compute the schema row without touching the BTree.
+	// The BTree write and cache refresh happen after consensus via applyFn/applyHook.
+	key, fields, err := ex.sc.BuildCreateTableCommand(s.Table, pkName, pkType, colNames, colTypes)
+	if err != nil {
 		return nil, fmt.Errorf("create table %q: %w", s.Table, err)
 	}
-
-	newSchema := ex.sc.FindTableSchema(s.Table)
-	if newSchema == nil {
-		return nil, fmt.Errorf("create table %q: schema not found after creation", s.Table)
-	}
-	schemaKey := encodeKey(0, newSchema.TableId)
-	schemaFields, _, err := ex.bt.Search(schemaKey)
-	if err != nil {
-		return nil, fmt.Errorf("read schema row for replication: %w", err)
-	}
-	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: schemaKey, Fields: schemaFields})
+	ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplPut, Key: key, Fields: fields})
 
 	return nil, nil
 }
@@ -505,17 +475,16 @@ func (ex *Executor) executeDrop(s *DropTableStatement, txnId uint64) (*ResultSet
 
 	dataRows, err := ex.bt.RangeScan(encodeKey(schema.TableId, 0), encodeKey(schema.TableId, ^uint32(0)))
 	if err != nil {
-		return nil, fmt.Errorf("scan table %q for replication: %w", s.Table, err)
+		return nil, fmt.Errorf("scan table %q for drop: %w", s.Table, err)
 	}
 
-	if err := ex.sc.DropTable(s.Table); err != nil {
-		return nil, fmt.Errorf("drop table %q: %w", s.Table, err)
-	}
-
+	// Buffer deletes for data rows first, then the schema row. The BTree writes and
+	// cache eviction happen after consensus via applyFn/applyHook (which calls
+	// LoadSchemas when it processes the schema key deletion).
 	for _, r := range dataRows {
-		ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: r.Key})
+		ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplDelete, Key: r.Key})
 	}
-	ex.tm.AppendRedo(txnId, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: schemaKey})
+	ex.tm.AppendRedo(txnId, raft.RaftCommand{Op: raft.ReplDelete, Key: schemaKey})
 
 	return nil, nil
 }

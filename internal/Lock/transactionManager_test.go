@@ -6,7 +6,7 @@ import (
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
-	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
+	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 )
 
 // ---- helpers ----
@@ -22,10 +22,20 @@ func newTMBTree(t *testing.T) *btree.BTree {
 }
 
 // newTestTM returns a TransactionManager (no replication) and the BTree it owns.
+// The applyFn writes committed RedoLog entries directly to the BTree.
 func newTestTM(t *testing.T) (*TransactionManager, *btree.BTree) {
 	t.Helper()
 	bt := newTMBTree(t)
-	return NewTransactionManager(bt, nil), bt
+	applyFn := func(op raft.ReplOp, key uint64, fields []btree.Field) error {
+		switch op {
+		case raft.ReplPut:
+			return bt.Insert(key, fields)
+		case raft.ReplDelete:
+			return bt.Delete(key)
+		}
+		return nil
+	}
+	return NewTransactionManager(bt, nil, applyFn), bt
 }
 
 func mustCommit(t *testing.T, tm *TransactionManager, txnId uint64) {
@@ -33,17 +43,6 @@ func mustCommit(t *testing.T, tm *TransactionManager, txnId uint64) {
 	if err := tm.Commit(txnId); err != nil {
 		t.Fatalf("Commit(%d): %v", txnId, err)
 	}
-}
-
-// newTestTMWithRM returns a TransactionManager wired to a real ReplicationManager.
-func newTestTMWithRM(t *testing.T) (*TransactionManager, *btree.BTree, *replication.ReplicationManager) {
-	t.Helper()
-	bt := newTMBTree(t)
-	rm, err := replication.NewReplicationManager(t.TempDir() + "/repl.log")
-	if err != nil {
-		t.Fatalf("NewReplicationManager: %v", err)
-	}
-	return NewTransactionManager(bt, rm), bt, rm
 }
 
 // intFields builds a single-field slice with an INT value, used as a minimal row.
@@ -153,17 +152,6 @@ func TestBegin_StatusIsActive(t *testing.T) {
 	}
 }
 
-func TestBegin_UndoLogInitialized(t *testing.T) {
-	tm, _ := newTestTM(t)
-	txn := tm.Begin()
-	if txn.UndoLog == nil {
-		t.Error("UndoLog should be non-nil after Begin")
-	}
-	if len(txn.UndoLog) != 0 {
-		t.Errorf("UndoLog should be empty, got len=%d", len(txn.UndoLog))
-	}
-}
-
 func TestBegin_MultipleTransactionsHaveUniqueIds(t *testing.T) {
 	tm, _ := newTestTM(t)
 	t1 := tm.Begin()
@@ -230,63 +218,6 @@ func TestTMLock_DeadlockReturnsError(t *testing.T) {
 	}
 }
 
-// ---- AppendUndo ----
-
-func TestAppendUndo_SingleEntry(t *testing.T) {
-	tm, _ := newTestTM(t)
-	txn := tm.Begin()
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	if len(txn.UndoLog) != 1 {
-		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
-	}
-	e := txn.UndoLog[0]
-	if e.Op != UndoInsert || e.Key != 100 {
-		t.Errorf("entry: got {Op:%v Key:%d}, want {UndoInsert 100}", e.Op, e.Key)
-	}
-}
-
-func TestAppendUndo_PreservesInsertionOrder(t *testing.T) {
-	tm, _ := newTestTM(t)
-	txn := tm.Begin()
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 1})
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoDelete, Key: 2, Fields: intFields(5)})
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoUpdate, Key: 3, Fields: intFields(9)})
-
-	if len(txn.UndoLog) != 3 {
-		t.Fatalf("UndoLog len: got %d, want 3", len(txn.UndoLog))
-	}
-	if txn.UndoLog[0].Op != UndoInsert || txn.UndoLog[0].Key != 1 {
-		t.Errorf("entry[0]: got %+v", txn.UndoLog[0])
-	}
-	if txn.UndoLog[1].Op != UndoDelete || txn.UndoLog[1].Key != 2 {
-		t.Errorf("entry[1]: got %+v", txn.UndoLog[1])
-	}
-	if txn.UndoLog[2].Op != UndoUpdate || txn.UndoLog[2].Key != 3 {
-		t.Errorf("entry[2]: got %+v", txn.UndoLog[2])
-	}
-}
-
-func TestAppendUndo_UnknownTxnIdIsNoop(t *testing.T) {
-	tm, _ := newTestTM(t)
-	tm.AppendUndo(999, UndoEntry{Op: UndoInsert, Key: 1}) // must not panic
-}
-
-func TestAppendUndo_DoesNotCrossContaminateTxns(t *testing.T) {
-	tm, _ := newTestTM(t)
-	t1 := tm.Begin()
-	t2 := tm.Begin()
-
-	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	tm.AppendUndo(t2.Id, UndoEntry{Op: UndoInsert, Key: 200})
-
-	if len(tm.active[t1.Id].UndoLog) != 1 || tm.active[t1.Id].UndoLog[0].Key != 100 {
-		t.Error("t1 undo log contaminated by t2's entry")
-	}
-	if len(tm.active[t2.Id].UndoLog) != 1 || tm.active[t2.Id].UndoLog[0].Key != 200 {
-		t.Error("t2 undo log contaminated by t1's entry")
-	}
-}
-
 // ---- Commit ----
 
 func TestCommit_RemovesFromActiveMap(t *testing.T) {
@@ -302,16 +233,6 @@ func TestCommit_SetsStatusCommitted(t *testing.T) {
 	mustCommit(t, tm, txn.Id)
 	if txn.Status != TxnCommitted {
 		t.Errorf("status: got %v, want TxnCommitted", txn.Status)
-	}
-}
-
-func TestCommit_ClearsUndoLog(t *testing.T) {
-	tm, _ := newTestTM(t)
-	txn := tm.Begin()
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	mustCommit(t, tm, txn.Id)
-	if txn.UndoLog != nil {
-		t.Error("UndoLog should be nil after commit")
 	}
 }
 
@@ -357,106 +278,74 @@ func TestCommit_DoesNotAffectOtherTransactions(t *testing.T) {
 
 // ---- Rollback ----
 
-func TestRollback_UndoInsert_DeletesRow(t *testing.T) {
+// In the deferred-write design the executor buffers all writes in RedoLog and never
+// touches the BTree before Commit. Rollback simply discards the RedoLog — there is
+// nothing to undo in the BTree. The tests below verify this new semantics.
+
+func TestRollback_PendingRedoInsert_NeverApplied(t *testing.T) {
+	// A buffered ReplPut that is rolled back must never reach the BTree.
 	tm, bt := newTestTM(t)
 	txn := tm.Begin()
-
-	if err := bt.Insert(100, intFields(42)); err != nil {
-		t.Fatalf("bt.Insert: %v", err)
-	}
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
-
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(42)})
 	tm.Rollback(txn.Id)
-
 	assertBTreeKeyAbsent(t, bt, 100)
 }
 
-func TestRollback_UndoDelete_ReInsertsRow(t *testing.T) {
+func TestRollback_PendingRedoDelete_DoesNotEraseCommittedRow(t *testing.T) {
+	// Commit a row, then buffer a delete and roll back — the committed row must survive.
 	tm, bt := newTestTM(t)
-	txn := tm.Begin()
+	txn1 := tm.Begin()
+	tm.AppendRedo(txn1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(42)})
+	mustCommit(t, tm, txn1.Id)
+	assertBTreeKeyValue(t, bt, 100, 42)
 
-	// The row was deleted during the txn; undo log holds the old fields.
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoDelete, Key: 100, Fields: intFields(42)})
-
-	tm.Rollback(txn.Id)
-
+	txn2 := tm.Begin()
+	tm.AppendRedo(txn2.Id, raft.RaftCommand{Op: raft.ReplDelete, Key: 100})
+	tm.Rollback(txn2.Id)
 	assertBTreeKeyValue(t, bt, 100, 42)
 }
 
-func TestRollback_UndoUpdate_RestoresOldFields(t *testing.T) {
+func TestRollback_PendingRedoUpdate_DoesNotModifyCommittedRow(t *testing.T) {
+	// Commit a row (value 42), buffer an update to 99 and roll back — the original must remain.
 	tm, bt := newTestTM(t)
-	txn := tm.Begin()
+	txn1 := tm.Begin()
+	tm.AppendRedo(txn1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(42)})
+	mustCommit(t, tm, txn1.Id)
 
-	// Row 100 was updated to 99; undo log holds original value 42.
-	if err := bt.Insert(100, intFields(99)); err != nil {
-		t.Fatalf("bt.Insert: %v", err)
-	}
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoUpdate, Key: 100, Fields: intFields(42)})
-
-	tm.Rollback(txn.Id)
-
+	txn2 := tm.Begin()
+	tm.AppendRedo(txn2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(99)})
+	tm.Rollback(txn2.Id)
 	assertBTreeKeyValue(t, bt, 100, 42)
 }
 
-func TestRollback_ReversesMultipleInserts(t *testing.T) {
+func TestRollback_PendingMultipleRedoInserts_NeverApplied(t *testing.T) {
+	// Multiple buffered inserts all discarded by a single rollback.
 	tm, bt := newTestTM(t)
 	txn := tm.Begin()
-
 	for _, key := range []uint64{100, 200, 300} {
-		if err := bt.Insert(key, intFields(int64(key))); err != nil {
-			t.Fatalf("bt.Insert(%d): %v", key, err)
-		}
-		tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: key})
+		tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: key, Fields: intFields(int64(key))})
 	}
-
 	tm.Rollback(txn.Id)
-
 	assertBTreeKeyAbsent(t, bt, 100)
 	assertBTreeKeyAbsent(t, bt, 200)
 	assertBTreeKeyAbsent(t, bt, 300)
 }
 
-func TestRollback_LIFOOrder_InsertThenUpdate(t *testing.T) {
-	// Sequence: INSERT row 100 (value 1), UPDATE row 100 (value 1 → 99).
-	// LIFO rollback: undo UPDATE first (restore 1), then undo INSERT (delete).
-	// Expected final state: row 100 absent.
+func TestRollback_MultiPendingOps_AllDiscarded(t *testing.T) {
+	// Commit row 100 (value 1). Buffer an update + a new insert, then roll back.
+	// Row 100 must keep its committed value; row 200 must not appear.
 	tm, bt := newTestTM(t)
-	txn := tm.Begin()
+	txn1 := tm.Begin()
+	tm.AppendRedo(txn1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(1)})
+	mustCommit(t, tm, txn1.Id)
 
-	if err := bt.Insert(100, intFields(1)); err != nil {
-		t.Fatalf("bt.Insert: %v", err)
-	}
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
+	txn2 := tm.Begin()
+	tm.AppendRedo(txn2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(99)})
+	tm.AppendRedo(txn2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 200, Fields: intFields(200)})
+	tm.Rollback(txn2.Id)
 
-	if err := bt.Insert(100, intFields(99)); err != nil { // btree insert overwrites — simulates UPDATE
-		t.Fatalf("bt.Insert: %v", err)
-	}
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoUpdate, Key: 100, Fields: intFields(1)})
-
-	tm.Rollback(txn.Id)
-
-	assertBTreeKeyAbsent(t, bt, 100)
-}
-
-func TestRollback_LIFOOrder_DeleteThenReInsert(t *testing.T) {
-	// Sequence: DELETE row 100 (old=42), INSERT row 100 (value 99).
-	// LIFO rollback: undo INSERT (delete 100), then undo DELETE (re-insert 42).
-	// Expected final state: row 100 exists with value 42.
-	tm, bt := newTestTM(t)
-	txn := tm.Begin()
-
-	// Undo log entry for "DELETE" comes first in log order
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoDelete, Key: 100, Fields: intFields(42)})
-
-	// Then an INSERT of key 100 with a new value
-	if err := bt.Insert(100, intFields(99)); err != nil {
-		t.Fatalf("bt.Insert: %v", err)
-	}
-	tm.AppendUndo(txn.Id, UndoEntry{Op: UndoInsert, Key: 100})
-
-	tm.Rollback(txn.Id)
-
-	assertBTreeKeyValue(t, bt, 100, 42)
+	assertBTreeKeyValue(t, bt, 100, 1)
+	assertBTreeKeyAbsent(t, bt, 200)
 }
 
 func TestRollback_RemovesFromActiveMap(t *testing.T) {
@@ -494,10 +383,10 @@ func TestRollback_ReleasesLocks(t *testing.T) {
 	waitFor(t, t2Locked, 100*time.Millisecond, "t2 should acquire lock after t1 rolls back")
 }
 
-func TestRollback_EmptyUndoLogIsNoop(t *testing.T) {
+func TestRollback_EmptyRedoLogIsNoop(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.Rollback(txn.Id) // no undo entries — just releases locks
+	tm.Rollback(txn.Id) // nothing buffered — just releases locks
 	assertNotInActive(t, tm, txn.Id)
 	if txn.Status != TxnAborted {
 		t.Errorf("status: got %v, want TxnAborted", txn.Status)
@@ -521,21 +410,19 @@ func TestRollback_DoesNotAffectOtherTransactions(t *testing.T) {
 	t1 := tm.Begin()
 	t2 := tm.Begin()
 
-	if err := bt.Insert(100, intFields(1)); err != nil {
-		t.Fatalf("bt.Insert(100): %v", err)
-	}
-	if err := bt.Insert(200, intFields(2)); err != nil {
-		t.Fatalf("bt.Insert(200): %v", err)
-	}
-	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	tm.AppendUndo(t2.Id, UndoEntry{Op: UndoInsert, Key: 200})
+	tm.AppendRedo(t1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(1)})
+	tm.AppendRedo(t2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 200, Fields: intFields(2)})
 
 	tm.Rollback(t1.Id)
 
-	assertBTreeKeyAbsent(t, bt, 100)   // t1's row rolled back
-	assertBTreeKeyValue(t, bt, 200, 2) // t2's row untouched
+	assertBTreeKeyAbsent(t, bt, 100) // t1's pending write never applied
 	assertNotInActive(t, tm, t1.Id)
 	assertInActive(t, tm, t2.Id)
+
+	// t2 can still commit cleanly
+	mustCommit(t, tm, t2.Id)
+	assertBTreeKeyValue(t, bt, 200, 2)
+	assertNotInActive(t, tm, t2.Id)
 }
 
 // ---- Multi-transaction scenarios ----
@@ -545,17 +432,11 @@ func TestMultiTxn_CommitOneRollbackOther(t *testing.T) {
 	t1 := tm.Begin()
 	t2 := tm.Begin()
 
-	if err := bt.Insert(100, intFields(1)); err != nil {
-		t.Fatalf("bt.Insert(100): %v", err)
-	}
-	if err := bt.Insert(200, intFields(2)); err != nil {
-		t.Fatalf("bt.Insert(200): %v", err)
-	}
-	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	tm.AppendUndo(t2.Id, UndoEntry{Op: UndoInsert, Key: 200})
+	tm.AppendRedo(t1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100, Fields: intFields(1)})
+	tm.AppendRedo(t2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 200, Fields: intFields(2)})
 
-	mustCommit(t, tm, t1.Id) // row 100 persists
-	tm.Rollback(t2.Id)       // row 200 deleted
+	mustCommit(t, tm, t1.Id) // row 100 applied via applyFn
+	tm.Rollback(t2.Id)       // row 200 never applied
 
 	assertBTreeKeyValue(t, bt, 100, 1)
 	assertBTreeKeyAbsent(t, bt, 200)
@@ -580,23 +461,6 @@ func TestMultiTxn_IdsNotReusedAfterRollback(t *testing.T) {
 	t2 := tm.Begin()
 	if t2.Id <= t1.Id {
 		t.Errorf("new txn ID (%d) should be greater than rolled-back txn ID (%d)", t2.Id, t1.Id)
-	}
-}
-
-func TestMultiTxn_UndoLogsAreIndependent(t *testing.T) {
-	tm, _ := newTestTM(t)
-	t1 := tm.Begin()
-	t2 := tm.Begin()
-
-	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 100})
-	tm.AppendUndo(t1.Id, UndoEntry{Op: UndoInsert, Key: 101})
-	tm.AppendUndo(t2.Id, UndoEntry{Op: UndoDelete, Key: 200, Fields: intFields(7)})
-
-	if len(tm.active[t1.Id].UndoLog) != 2 {
-		t.Errorf("t1 UndoLog len: got %d, want 2", len(tm.active[t1.Id].UndoLog))
-	}
-	if len(tm.active[t2.Id].UndoLog) != 1 {
-		t.Errorf("t2 UndoLog len: got %d, want 1", len(tm.active[t2.Id].UndoLog))
 	}
 }
 
@@ -657,12 +521,12 @@ func TestMultiTxn_ThreeTransactionsSerialised(t *testing.T) {
 func TestAppendRedo_SingleEntry(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 100})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100})
 	if len(txn.RedoLog) != 1 {
 		t.Fatalf("RedoLog len: got %d, want 1", len(txn.RedoLog))
 	}
 	e := txn.RedoLog[0]
-	if e.Op != replication.ReplPut || e.Key != 100 {
+	if e.Op != raft.ReplPut || e.Key != 100 {
 		t.Errorf("entry: got {Op:%v Key:%d}, want {ReplPut 100}", e.Op, e.Key)
 	}
 }
@@ -670,9 +534,9 @@ func TestAppendRedo_SingleEntry(t *testing.T) {
 func TestAppendRedo_PreservesInsertionOrder(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 2})
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 3})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 1})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplDelete, Key: 2})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 3})
 
 	if len(txn.RedoLog) != 3 {
 		t.Fatalf("RedoLog len: got %d, want 3", len(txn.RedoLog))
@@ -684,7 +548,7 @@ func TestAppendRedo_PreservesInsertionOrder(t *testing.T) {
 
 func TestAppendRedo_UnknownTxnIdIsNoop(t *testing.T) {
 	tm, _ := newTestTM(t)
-	tm.AppendRedo(999, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1}) // must not panic
+	tm.AppendRedo(999, raft.RaftCommand{Op: raft.ReplPut, Key: 1}) // must not panic
 }
 
 func TestAppendRedo_DoesNotCrossContaminateTxns(t *testing.T) {
@@ -692,8 +556,8 @@ func TestAppendRedo_DoesNotCrossContaminateTxns(t *testing.T) {
 	t1 := tm.Begin()
 	t2 := tm.Begin()
 
-	tm.AppendRedo(t1.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 100})
-	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 200})
+	tm.AppendRedo(t1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 100})
+	tm.AppendRedo(t2.Id, raft.RaftCommand{Op: raft.ReplDelete, Key: 200})
 
 	if len(tm.active[t1.Id].RedoLog) != 1 || tm.active[t1.Id].RedoLog[0].Key != 100 {
 		t.Error("t1 redo log contaminated by t2's entry")
@@ -703,96 +567,48 @@ func TestAppendRedo_DoesNotCrossContaminateTxns(t *testing.T) {
 	}
 }
 
-// ---- Commit + replication ----
-
-func TestCommit_FlushesRedoLogToReplicationManager(t *testing.T) {
-	tm, _, rm := newTestTMWithRM(t)
-	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 42})
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 99})
-	mustCommit(t, tm, txn.Id)
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("want 2 replication entries, got %d", len(entries))
-	}
-	if entries[0].Key != 42 || entries[0].Op != replication.ReplPut {
-		t.Errorf("entry 0: got {Key:%d Op:%v}, want {42 ReplPut}", entries[0].Key, entries[0].Op)
-	}
-	if entries[1].Key != 99 || entries[1].Op != replication.ReplDelete {
-		t.Errorf("entry 1: got {Key:%d Op:%v}, want {99 ReplDelete}", entries[1].Key, entries[1].Op)
-	}
-}
+// ---- Commit + raft ----
 
 func TestCommit_ClearsRedoLog(t *testing.T) {
 	tm, _ := newTestTM(t)
 	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 1})
 	mustCommit(t, tm, txn.Id)
 	if txn.RedoLog != nil {
 		t.Error("RedoLog should be nil after commit")
 	}
 }
 
-func TestCommit_EmptyRedoLog_NothingWrittenToReplication(t *testing.T) {
-	tm, _, rm := newTestTMWithRM(t)
+func TestCommit_NilRaftNode_DoesNotPanic(t *testing.T) {
+	tm, _ := newTestTM(t) // rn=nil
 	txn := tm.Begin()
-	mustCommit(t, tm, txn.Id) // no redo entries
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("empty redo log: want 0 replication entries, got %d", len(entries))
-	}
-}
-
-func TestCommit_NilReplicationManager_DoesNotPanic(t *testing.T) {
-	tm, _ := newTestTM(t) // rm=nil
-	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 1, Fields: intFields(42)})
 	mustCommit(t, tm, txn.Id) // must not panic
 }
 
-func TestCommit_MultipleTransactions_AllFlushedInOrder(t *testing.T) {
-	tm, _, rm := newTestTMWithRM(t)
+func TestCommit_MultipleRedoEntries_AllCleared(t *testing.T) {
+	tm, _ := newTestTM(t)
 
 	t1 := tm.Begin()
-	tm.AppendRedo(t1.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
+	tm.AppendRedo(t1.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 1, Fields: intFields(1)})
 	mustCommit(t, tm, t1.Id)
 
 	t2 := tm.Begin()
-	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 2})
-	tm.AppendRedo(t2.Id, replication.ReplicationLogEntry{Op: replication.ReplDelete, Key: 3})
+	tm.AppendRedo(t2.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 2, Fields: intFields(2)})
+	tm.AppendRedo(t2.Id, raft.RaftCommand{Op: raft.ReplDelete, Key: 1}) // key 1 exists from t1
 	mustCommit(t, tm, t2.Id)
 
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
+	if t1.RedoLog != nil {
+		t.Error("t1 RedoLog should be nil after commit")
 	}
-	if len(entries) != 3 {
-		t.Fatalf("want 3 total replication entries, got %d", len(entries))
-	}
-	if entries[0].Key != 1 || entries[1].Key != 2 || entries[2].Key != 3 {
-		t.Errorf("keys out of order: got %d %d %d, want 1 2 3", entries[0].Key, entries[1].Key, entries[2].Key)
+	if t2.RedoLog != nil {
+		t.Error("t2 RedoLog should be nil after commit")
 	}
 }
 
-func TestRollback_DoesNotWriteToReplicationLog(t *testing.T) {
-	tm, _, rm := newTestTMWithRM(t)
+func TestRollback_DoesNotProposeToRaft(t *testing.T) {
+	tm, _ := newTestTM(t) // rn=nil — if Propose were called it would panic
 	txn := tm.Begin()
-	tm.AppendRedo(txn.Id, replication.ReplicationLogEntry{Op: replication.ReplPut, Key: 1})
-	tm.Rollback(txn.Id)
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("rollback must not write to replication log, got %d entries", len(entries))
-	}
+	tm.AppendRedo(txn.Id, raft.RaftCommand{Op: raft.ReplPut, Key: 1})
+	tm.Rollback(txn.Id) // must not panic or call Propose
 }
