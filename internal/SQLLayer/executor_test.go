@@ -6,7 +6,7 @@ import (
 
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
-	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
+	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 )
 
 // ---- Test infrastructure ----
@@ -15,7 +15,23 @@ func newTestExecutor(t *testing.T) *Executor {
 	t.Helper()
 	bt := newTestBTree(t)
 	sc := NewSchemaCatalog(bt)
-	tm := lock.NewTransactionManager(bt, nil)
+	applyFn := func(op raft.ReplOp, key uint64, fields []btree.Field) error {
+		var err error
+		switch op {
+		case raft.ReplPut:
+			err = bt.Insert(key, fields)
+		case raft.ReplDelete:
+			err = bt.Delete(key)
+		}
+		if err != nil {
+			return err
+		}
+		if key>>32 == 0 {
+			return sc.LoadSchemas()
+		}
+		return nil
+	}
+	tm := lock.NewTransactionManager(bt, nil, applyFn)
 	return NewExecutor(sc, bt, tm)
 }
 
@@ -24,18 +40,6 @@ func mustCommitTM(t *testing.T, tm *lock.TransactionManager, txnId uint64) {
 	if err := tm.Commit(txnId); err != nil {
 		t.Fatalf("Commit(%d): %v", txnId, err)
 	}
-}
-
-func newTestExecutorWithRM(t *testing.T) (*Executor, *replication.ReplicationManager) {
-	t.Helper()
-	bt := newTestBTree(t)
-	sc := NewSchemaCatalog(bt)
-	rm, err := replication.NewReplicationManager(t.TempDir() + "/repl.log")
-	if err != nil {
-		t.Fatalf("NewReplicationManager: %v", err)
-	}
-	tm := lock.NewTransactionManager(bt, rm)
-	return NewExecutor(sc, bt, tm), rm
 }
 
 // mustExecSQL tokenizes, parses, and executes a SQL string, failing on any error.
@@ -1185,139 +1189,6 @@ func mustExecInTxn(t *testing.T, ex *Executor, txnId uint64, query string) *Resu
 	return rs
 }
 
-// ---- Undo log correctness ----
-
-func TestUndoLog_InsertRecordsUndoInsertOp(t *testing.T) {
-	ex := setupUsersTable(t)
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	if len(txn.UndoLog) != 1 {
-		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
-	}
-	if txn.UndoLog[0].Op != lock.UndoInsert {
-		t.Errorf("Op: got %v, want UndoInsert", txn.UndoLog[0].Op)
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_InsertHasNilFields(t *testing.T) {
-	ex := setupUsersTable(t)
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	if txn.UndoLog[0].Fields != nil {
-		t.Error("UndoInsert entry should have nil Fields")
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_DeleteRecordsUndoDeleteWithSavedFields(t *testing.T) {
-	ex := setupUsersTable(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "DELETE FROM users WHERE id = 1")
-
-	if len(txn.UndoLog) != 1 {
-		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
-	}
-	e := txn.UndoLog[0]
-	if e.Op != lock.UndoDelete {
-		t.Errorf("Op: got %v, want UndoDelete", e.Op)
-	}
-	if e.Fields == nil {
-		t.Error("UndoDelete entry must save old Fields")
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_UpdateRecordsUndoUpdateWithSavedFields(t *testing.T) {
-	ex := setupUsersTable(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 1")
-
-	if len(txn.UndoLog) != 1 {
-		t.Fatalf("UndoLog len: got %d, want 1", len(txn.UndoLog))
-	}
-	e := txn.UndoLog[0]
-	if e.Op != lock.UndoUpdate {
-		t.Errorf("Op: got %v, want UndoUpdate", e.Op)
-	}
-	if e.Fields == nil {
-		t.Error("UndoUpdate entry must save old Fields")
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_UpdateSavesPreUpdateFieldValue(t *testing.T) {
-	// The saved fields must hold the value *before* the update (30, not 99).
-	ex := setupUsersTable(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99 WHERE id = 1")
-
-	// fields layout: [id(tag0), name(tag1), age(tag2)]
-	oldAge := fieldIntVal(t, txn.UndoLog[0].Fields[2], "old_age")
-	if oldAge != 30 {
-		t.Errorf("saved age: got %d, want 30 (pre-update value)", oldAge)
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_SelectDoesNotRecord(t *testing.T) {
-	ex := setupUsersTable(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "SELECT * FROM users")
-
-	if len(txn.UndoLog) != 0 {
-		t.Errorf("SELECT should produce no undo entries, got %d", len(txn.UndoLog))
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_MultipleInsertsAccumulate(t *testing.T) {
-	ex := setupUsersTable(t)
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (2, 'bob', 25)")
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (3, 'carol', 35)")
-
-	if len(txn.UndoLog) != 3 {
-		t.Fatalf("UndoLog len: got %d, want 3", len(txn.UndoLog))
-	}
-	for i, e := range txn.UndoLog {
-		if e.Op != lock.UndoInsert {
-			t.Errorf("entry[%d]: Op = %v, want UndoInsert", i, e.Op)
-		}
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-func TestUndoLog_UpdateNoWhereRecordsOneEntryPerRow(t *testing.T) {
-	ex := setupUsersTable(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "UPDATE users SET age = 99")
-
-	if len(txn.UndoLog) != 2 {
-		t.Errorf("UndoLog len: got %d, want 2 (one per matched row)", len(txn.UndoLog))
-	}
-	for i, e := range txn.UndoLog {
-		if e.Op != lock.UndoUpdate {
-			t.Errorf("entry[%d]: Op = %v, want UndoUpdate", i, e.Op)
-		}
-	}
-	mustCommitTM(t, ex.tm, txn.Id)
-}
-
 // ---- Rollback correctness ----
 
 func TestRollback_InsertIsReverted(t *testing.T) {
@@ -1493,29 +1364,22 @@ func TestInsertLock_ReleasedOnRollback(t *testing.T) {
 
 // ---- RedoLog population by executor ----
 
-func setupUsersTableWithRM(t *testing.T) (*Executor, *replication.ReplicationManager) {
-	t.Helper()
-	ex, rm := newTestExecutorWithRM(t)
-	mustExecSQL(t, ex, "CREATE TABLE users (id INT, name TEXT, age INT)")
-	return ex, rm
-}
-
 func TestRedoLog_InsertRecordsReplPutOp(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	txn := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	if len(txn.RedoLog) != 1 {
 		t.Fatalf("RedoLog len: got %d, want 1", len(txn.RedoLog))
 	}
-	if txn.RedoLog[0].Op != replication.ReplPut {
+	if txn.RedoLog[0].Op != raft.ReplPut {
 		t.Errorf("Op: got %v, want ReplPut", txn.RedoLog[0].Op)
 	}
 	mustCommitTM(t, ex.tm, txn.Id)
 }
 
 func TestRedoLog_InsertHasNonZeroKey(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	txn := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 
@@ -1526,7 +1390,7 @@ func TestRedoLog_InsertHasNonZeroKey(t *testing.T) {
 }
 
 func TestRedoLog_InsertHasFields(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	txn := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 
@@ -1537,7 +1401,7 @@ func TestRedoLog_InsertHasFields(t *testing.T) {
 }
 
 func TestRedoLog_DeleteRecordsReplDeleteOp(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	txn := ex.tm.Begin()
@@ -1546,14 +1410,14 @@ func TestRedoLog_DeleteRecordsReplDeleteOp(t *testing.T) {
 	if len(txn.RedoLog) != 1 {
 		t.Fatalf("RedoLog len: got %d, want 1", len(txn.RedoLog))
 	}
-	if txn.RedoLog[0].Op != replication.ReplDelete {
+	if txn.RedoLog[0].Op != raft.ReplDelete {
 		t.Errorf("Op: got %v, want ReplDelete", txn.RedoLog[0].Op)
 	}
 	mustCommitTM(t, ex.tm, txn.Id)
 }
 
 func TestRedoLog_DeleteHasNilFields(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	txn := ex.tm.Begin()
@@ -1566,7 +1430,7 @@ func TestRedoLog_DeleteHasNilFields(t *testing.T) {
 }
 
 func TestRedoLog_UpdateRecordsReplPutOp(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	txn := ex.tm.Begin()
@@ -1575,14 +1439,14 @@ func TestRedoLog_UpdateRecordsReplPutOp(t *testing.T) {
 	if len(txn.RedoLog) != 1 {
 		t.Fatalf("RedoLog len: got %d, want 1", len(txn.RedoLog))
 	}
-	if txn.RedoLog[0].Op != replication.ReplPut {
+	if txn.RedoLog[0].Op != raft.ReplPut {
 		t.Errorf("Op: got %v, want ReplPut", txn.RedoLog[0].Op)
 	}
 	mustCommitTM(t, ex.tm, txn.Id)
 }
 
 func TestRedoLog_SelectDoesNotRecord(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	txn := ex.tm.Begin()
@@ -1595,7 +1459,7 @@ func TestRedoLog_SelectDoesNotRecord(t *testing.T) {
 }
 
 func TestRedoLog_MultipleInsertsMakeMultipleEntries(t *testing.T) {
-	ex, _ := setupUsersTableWithRM(t)
+	ex := setupUsersTable(t)
 	txn := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (2, 'bob', 25)")
@@ -1605,115 +1469,4 @@ func TestRedoLog_MultipleInsertsMakeMultipleEntries(t *testing.T) {
 		t.Errorf("RedoLog len: got %d, want 3", len(txn.RedoLog))
 	}
 	mustCommitTM(t, ex.tm, txn.Id)
-}
-
-// ---- Replication log written on commit, not on rollback ----
-
-func TestReplication_CommitFlushesInsertToLog(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	// entry 0 = CREATE TABLE schema row, entry 1 = INSERT
-	if len(entries) != 2 {
-		t.Fatalf("want 2 replication entries after INSERT commit, got %d", len(entries))
-	}
-	if entries[1].Op != replication.ReplPut {
-		t.Errorf("entry Op: got %v, want ReplPut", entries[1].Op)
-	}
-}
-
-func TestReplication_CommitFlushesDeleteToLog(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-	mustExecSQL(t, ex, "DELETE FROM users WHERE id = 1")
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	// entry 0 = CREATE TABLE, entry 1 = INSERT, entry 2 = DELETE
-	if len(entries) != 3 {
-		t.Fatalf("want 3 replication entries, got %d", len(entries))
-	}
-	if entries[2].Op != replication.ReplDelete {
-		t.Errorf("delete entry Op: got %v, want ReplDelete", entries[2].Op)
-	}
-}
-
-func TestReplication_CommitFlushesUpdateToLog(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-	mustExecSQL(t, ex, "UPDATE users SET age = 99 WHERE id = 1")
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	// entry 0 = CREATE TABLE, entry 1 = INSERT, entry 2 = UPDATE
-	if len(entries) != 3 {
-		t.Fatalf("want 3 replication entries, got %d", len(entries))
-	}
-	if entries[2].Op != replication.ReplPut {
-		t.Errorf("update entry Op: got %v, want ReplPut", entries[2].Op)
-	}
-}
-
-func TestReplication_RollbackDoesNotFlushToLog(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-
-	txn := ex.tm.Begin()
-	mustExecInTxn(t, ex, txn.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
-	ex.tm.Rollback(txn.Id)
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	// CREATE TABLE is committed before the rolled-back INSERT, so 1 entry exists.
-	if len(entries) != 1 {
-		t.Errorf("only the CREATE TABLE entry should be in log, got %d entries", len(entries))
-	}
-}
-
-func TestReplication_LSNsMonotonicallyIncrease(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")
-	mustExecSQL(t, ex, "DELETE FROM users WHERE id = 1")
-
-	entries, err := rm.ReadFrom(0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
-	}
-	// entry 0 = CREATE TABLE, entries 1-3 = INSERT/INSERT/DELETE
-	if len(entries) != 4 {
-		t.Fatalf("want 4 replication entries, got %d", len(entries))
-	}
-	for i := 1; i < len(entries); i++ {
-		if entries[i].LSN <= entries[i-1].LSN {
-			t.Errorf("LSN not monotonically increasing at index %d: %d <= %d", i, entries[i].LSN, entries[i-1].LSN)
-		}
-	}
-}
-
-func TestReplication_ReadFrom_FiltersCommittedEntries(t *testing.T) {
-	ex, rm := setupUsersTableWithRM(t)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)") // LSN 1 (LSN 0 = CREATE TABLE)
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (2, 'bob', 25)")   // LSN 2
-	mustExecSQL(t, ex, "INSERT INTO users VALUES (3, 'carol', 35)") // LSN 3
-
-	entries, err := rm.ReadFrom(2)
-	if err != nil {
-		t.Fatalf("ReadFrom(2): %v", err)
-	}
-	if len(entries) != 2 {
-		t.Errorf("ReadFrom(2): want 2 entries (LSN 2,3), got %d", len(entries))
-	}
-	if len(entries) > 0 && entries[0].LSN != 2 {
-		t.Errorf("first entry LSN: got %d, want 2", entries[0].LSN)
-	}
 }

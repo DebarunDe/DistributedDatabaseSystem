@@ -2,19 +2,10 @@ package lock
 
 import (
 	"log"
-	"slices"
 	"sync"
 
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
-	replication "github.com/your-username/DistributedDatabaseSystem/internal/replication"
-)
-
-type UndoOp int
-
-const (
-	UndoInsert UndoOp = iota
-	UndoDelete
-	UndoUpdate
+	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 )
 
 type TxnStatus int
@@ -25,35 +16,42 @@ const (
 	TxnAborted
 )
 
-type UndoEntry struct {
-	Op     UndoOp
-	Key    uint64
-	Fields []btree.Field //nil for UndoInsert, old row info for the others
-}
-
 type Transaction struct {
 	Id      uint64
 	Status  TxnStatus
-	UndoLog []UndoEntry
-	RedoLog []replication.ReplicationLogEntry
+	RedoLog []raft.RaftCommand
 }
+
+// ApplyFn is called once per committed RaftCommand to apply it to the local state
+// machine. In standalone mode it writes directly to the BTree (and reloads schemas
+// for schema-key writes). In Raft mode the same function is registered as the
+// RaftNode's applyHook and is invoked from applyCommitted after consensus.
+type ApplyFn func(op raft.ReplOp, key uint64, fields []btree.Field) error
 
 type TransactionManager struct {
-	mu     sync.Mutex
-	nextId uint64
-	active map[uint64]*Transaction
-	lm     *LockManager
-	bt     *btree.BTree
-	rm     *replication.ReplicationManager
+	mu      sync.Mutex
+	nextId  uint64
+	active  map[uint64]*Transaction
+	lm      *LockManager
+	bt      *btree.BTree
+	rn      *raft.RaftNode
+	applyFn ApplyFn
 }
 
-func NewTransactionManager(bt *btree.BTree, rm *replication.ReplicationManager) *TransactionManager {
+// NewTransactionManager creates a TransactionManager.
+//
+//   - rn: the Raft node (nil for standalone mode).
+//   - applyFn: called after each committed command to update the BTree and any
+//     derived state (e.g. SchemaCatalog). In Raft mode the same function should
+//     be passed to rn.SetApplyHook so the leader and followers use identical logic.
+func NewTransactionManager(bt *btree.BTree, rn *raft.RaftNode, applyFn ApplyFn) *TransactionManager {
 	return &TransactionManager{
-		nextId: 1,
-		active: make(map[uint64]*Transaction),
-		lm:     NewLockManager(),
-		bt:     bt,
-		rm:     rm,
+		nextId:  1,
+		active:  make(map[uint64]*Transaction),
+		lm:      NewLockManager(),
+		bt:      bt,
+		rn:      rn,
+		applyFn: applyFn,
 	}
 }
 
@@ -62,8 +60,7 @@ func (tm *TransactionManager) Begin() *Transaction {
 	t := &Transaction{
 		Id:      tm.nextId,
 		Status:  TxnActive,
-		UndoLog: make([]UndoEntry, 0),
-		RedoLog: make([]replication.ReplicationLogEntry, 0),
+		RedoLog: make([]raft.RaftCommand, 0),
 	}
 	tm.active[tm.nextId] = t
 	tm.nextId++
@@ -75,15 +72,7 @@ func (tm *TransactionManager) Lock(txnId uint64, rowKey uint64, lockType LockTyp
 	return tm.lm.Lock(txnId, rowKey, lockType)
 }
 
-func (tm *TransactionManager) AppendUndo(txnId uint64, entry UndoEntry) {
-	tm.mu.Lock()
-	if t := tm.active[txnId]; t != nil {
-		t.UndoLog = append(t.UndoLog, entry)
-	}
-	tm.mu.Unlock()
-}
-
-func (tm *TransactionManager) AppendRedo(txnId uint64, entry replication.ReplicationLogEntry) {
+func (tm *TransactionManager) AppendRedo(txnId uint64, entry raft.RaftCommand) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -92,6 +81,12 @@ func (tm *TransactionManager) AppendRedo(txnId uint64, entry replication.Replica
 	}
 }
 
+// Commit finalises the transaction. The BTree is updated exactly once, after all
+// validation has passed:
+//
+//   - Raft mode (rn != nil): commands are proposed to the cluster; applyCommitted
+//     calls applyHook on every node (including the leader) after consensus.
+//   - Standalone mode: commands are applied directly via applyFn.
 func (tm *TransactionManager) Commit(txnId uint64) error {
 	tm.mu.Lock()
 	t := tm.active[txnId]
@@ -99,16 +94,28 @@ func (tm *TransactionManager) Commit(txnId uint64) error {
 		tm.mu.Unlock()
 		return nil
 	}
+	commands := make([]raft.RaftCommand, len(t.RedoLog))
+	copy(commands, t.RedoLog)
+	tm.mu.Unlock()
 
-	if tm.rm != nil && len(t.RedoLog) > 0 {
-		if err := tm.rm.Append(t.RedoLog); err != nil {
-			tm.mu.Unlock()
+	if tm.rn != nil && len(commands) > 0 {
+		// Raft mode: Propose blocks until the entry is committed AND applied on
+		// this node via applyHook (which is the same applyFn set at startup).
+		if err := tm.rn.Propose(commands); err != nil {
+			tm.discard(txnId)
 			return err
+		}
+	} else if tm.applyFn != nil && len(commands) > 0 {
+		// Standalone mode: apply the RedoLog directly via applyFn.
+		for _, cmd := range commands {
+			if err := tm.applyFn(cmd.Op, cmd.Key, cmd.Fields); err != nil {
+				log.Printf("commit: apply key=%d: %v", cmd.Key, err)
+			}
 		}
 	}
 
+	tm.mu.Lock()
 	t.Status = TxnCommitted
-	t.UndoLog = nil
 	t.RedoLog = nil
 	delete(tm.active, txnId)
 	tm.mu.Unlock()
@@ -116,35 +123,22 @@ func (tm *TransactionManager) Commit(txnId uint64) error {
 	return nil
 }
 
-func (tm *TransactionManager) Rollback(txnId uint64) {
+// discard removes a transaction from the active map. Used when Propose fails —
+// the executor never wrote to the BTree before consensus, so there is nothing to undo.
+func (tm *TransactionManager) discard(txnId uint64) {
 	tm.mu.Lock()
 	t := tm.active[txnId]
-	if t == nil {
-		tm.mu.Unlock()
-		return
+	if t != nil {
+		t.Status = TxnAborted
+		delete(tm.active, txnId)
 	}
-	undoLog := t.UndoLog
-	t.UndoLog = nil
-	t.Status = TxnAborted
-	delete(tm.active, txnId)
 	tm.mu.Unlock()
-
-	for _, entry := range slices.Backward(undoLog) {
-		switch entry.Op {
-		case UndoInsert:
-			if err := tm.bt.Delete(entry.Key); err != nil {
-				log.Printf("rollback: undo insert for key %d: %v", entry.Key, err)
-			}
-		case UndoDelete:
-			if err := tm.bt.Insert(entry.Key, entry.Fields); err != nil {
-				log.Printf("rollback: undo delete for key %d: %v", entry.Key, err)
-			}
-		case UndoUpdate:
-			if err := tm.bt.Insert(entry.Key, entry.Fields); err != nil {
-				log.Printf("rollback: undo update for key %d: %v", entry.Key, err)
-			}
-		}
-	}
-
 	tm.lm.UnlockAll(txnId)
+}
+
+// Rollback discards all buffered operations for the transaction. Because the
+// executor defers all BTree writes to after consensus, there is nothing to undo
+// in the BTree — the RedoLog is simply dropped.
+func (tm *TransactionManager) Rollback(txnId uint64) {
+	tm.discard(txnId)
 }

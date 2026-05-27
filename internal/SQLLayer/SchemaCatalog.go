@@ -38,7 +38,8 @@ func (sc *SchemaCatalog) LoadSchemas() error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.cache = make(map[string]*TableSchemaValue)
-	sc.maxTableId = 0
+	// maxTableId is a high-water mark: never reset it so that dropped-then-recreated
+	// tables always get a strictly higher ID within the same server session.
 	results, err := sc.bt.RangeScan(encodeKey(0, 0), encodeKey(0, ^uint32(0)))
 	if err != nil {
 		return fmt.Errorf("range scan over table 0: %w", err)
@@ -128,60 +129,73 @@ func (sc *SchemaCatalog) NextTableId() uint32 {
 	return sc.maxTableId + 1
 }
 
+// buildSchemaFields encodes a table schema as the BTree fields stored under
+// encodeKey(0, tableId). Shared by BuildCreateTableCommand and CreateTable.
+func buildSchemaFields(tableName, pkName, pkType string, colNames, colTypes []string) []btree.Field {
+	fields := []btree.Field{
+		{Tag: 1, Value: btree.StringValue{V: tableName}},
+		{Tag: 2, Value: btree.StringValue{V: pkName}},
+		{Tag: 3, Value: btree.StringValue{V: pkType}},
+	}
+	nameElems := make([]btree.Value, len(colNames))
+	typeElems := make([]btree.Value, len(colTypes))
+	for i := range colNames {
+		nameElems[i] = btree.StringValue{V: colNames[i]}
+		typeElems[i] = btree.StringValue{V: colTypes[i]}
+	}
+	fields = append(fields,
+		btree.Field{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: nameElems}},
+		btree.Field{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: typeElems}},
+	)
+	return fields
+}
+
+// BuildCreateTableCommand validates that the table does not exist, reserves the next
+// table ID (incrementing maxTableId), and returns the BTree key+fields for the schema
+// row — without touching the BTree or updating the in-memory cache. The cache is
+// refreshed later when applyHook calls LoadSchemas after the write is committed.
+// On Propose failure the caller must invoke LoadSchemas to reset maxTableId.
+func (sc *SchemaCatalog) BuildCreateTableCommand(tableName, pkName, pkType string, colNames, colTypes []string) (uint64, []btree.Field, error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if _, ok := sc.cache[tableName]; ok {
+		return 0, nil, fmt.Errorf("table %q already exists", tableName)
+	}
+	if len(colNames) != len(colTypes) {
+		return 0, nil, fmt.Errorf("column name/type count mismatch (%d vs %d)", len(colNames), len(colTypes))
+	}
+	newTableId := sc.maxTableId + 1
+	sc.maxTableId = newTableId // reserve so concurrent creates get distinct IDs
+	key := encodeKey(0, newTableId)
+	return key, buildSchemaFields(tableName, pkName, pkType, colNames, colTypes), nil
+}
+
 // CreateTable validates that table name to be added does not exist, assigns new table id, encodes as catalog row, and adds to cache
 func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, primaryKeyType string, columnNames []string, columnTypes []string) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	//validate tableName not in cache
 	if _, ok := sc.cache[tableName]; ok {
-		return fmt.Errorf("table Name: %s already exists", tableName)
+		return fmt.Errorf("table %q already exists", tableName)
 	}
-
 	if len(columnNames) != len(columnTypes) {
-		return fmt.Errorf("mismatched columnNames length and columnTypes length, received columnName length: %d, columnType length: %d", len(columnNames), len(columnTypes))
+		return fmt.Errorf("column name/type count mismatch (%d vs %d)", len(columnNames), len(columnTypes))
 	}
 
-	//assign new table id
 	newTableId := sc.maxTableId + 1
-
-	//encode as catalog row
 	key := encodeKey(0, newTableId)
-	fields := []btree.Field{
-		{Tag: 1, Value: btree.StringValue{V: tableName}},
-		{Tag: 2, Value: btree.StringValue{V: primaryKeyName}},
-		{Tag: 3, Value: btree.StringValue{V: primaryKeyType}},
-	}
+	fields := buildSchemaFields(tableName, primaryKeyName, primaryKeyType, columnNames, columnTypes)
 
-	nameElems := make([]btree.Value, len(columnNames))
-	typeElems := make([]btree.Value, len(columnTypes))
-	for i := range len(columnNames) {
-		nameElems[i] = btree.StringValue{V: columnNames[i]}
-		typeElems[i] = btree.StringValue{V: columnTypes[i]}
-	}
-	fields = append(fields, btree.Field{
-		Tag:   4,
-		Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: nameElems},
-	})
-	fields = append(fields, btree.Field{
-		Tag:   5,
-		Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: typeElems},
-	})
-
-	//Insert first, if failed we return without polluting cache
-	err := sc.bt.Insert(key, fields)
-	if err != nil {
+	if err := sc.bt.Insert(key, fields); err != nil {
 		return fmt.Errorf("error inserting table into BTree: %w", err)
 	}
 
 	sc.maxTableId = newTableId
 
-	//insert into cache
 	PrimaryKey := ColumnDef{
 		Name:     primaryKeyName,
 		DataType: primaryKeyType,
 	}
 
-	//turn columnNames and columnTypes into array of columnDefs
 	columns := []ColumnDef{}
 	for i := range len(columnNames) {
 		name := columnNames[i]
