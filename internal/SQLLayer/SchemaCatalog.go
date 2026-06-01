@@ -29,7 +29,7 @@ func NewSchemaCatalog(bt *btree.BTree) *SchemaCatalog {
 }
 
 // encodes table keys with primary key information
-func encodeKey(tableId uint32, primaryKey uint32) uint64 {
+func EncodeKey(tableId uint32, primaryKey uint32) uint64 {
 	return (uint64(tableId) << 32) | uint64(primaryKey)
 }
 
@@ -40,7 +40,7 @@ func (sc *SchemaCatalog) LoadSchemas() error {
 	sc.cache = make(map[string]*TableSchemaValue)
 	// maxTableId is a high-water mark: never reset it so that dropped-then-recreated
 	// tables always get a strictly higher ID within the same server session.
-	results, err := sc.bt.RangeScan(encodeKey(0, 0), encodeKey(0, ^uint32(0)))
+	results, err := sc.bt.RangeScan(EncodeKey(0, 0), EncodeKey(0, ^uint32(0)))
 	if err != nil {
 		return fmt.Errorf("range scan over table 0: %w", err)
 	}
@@ -130,7 +130,7 @@ func (sc *SchemaCatalog) NextTableId() uint32 {
 }
 
 // buildSchemaFields encodes a table schema as the BTree fields stored under
-// encodeKey(0, tableId). Shared by BuildCreateTableCommand and CreateTable.
+// EncodeKey(0, tableId). Shared by BuildCreateTableCommand and CreateTable.
 func buildSchemaFields(tableName, pkName, pkType string, colNames, colTypes []string) []btree.Field {
 	fields := []btree.Field{
 		{Tag: 1, Value: btree.StringValue{V: tableName}},
@@ -166,7 +166,7 @@ func (sc *SchemaCatalog) BuildCreateTableCommand(tableName, pkName, pkType strin
 	}
 	newTableId := sc.maxTableId + 1
 	sc.maxTableId = newTableId // reserve so concurrent creates get distinct IDs
-	key := encodeKey(0, newTableId)
+	key := EncodeKey(0, newTableId)
 	return key, buildSchemaFields(tableName, pkName, pkType, colNames, colTypes), nil
 }
 
@@ -182,7 +182,7 @@ func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, pr
 	}
 
 	newTableId := sc.maxTableId + 1
-	key := encodeKey(0, newTableId)
+	key := EncodeKey(0, newTableId)
 	fields := buildSchemaFields(tableName, primaryKeyName, primaryKeyType, columnNames, columnTypes)
 
 	if err := sc.bt.Insert(key, fields); err != nil {
@@ -226,7 +226,7 @@ func (sc *SchemaCatalog) DropTable(tableName string) error {
 
 	//get rid of data rows
 	tableId := sc.cache[tableName].TableId
-	rows, err := sc.bt.RangeScan(encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)))
+	rows, err := sc.bt.RangeScan(EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)))
 	if err != nil {
 		return fmt.Errorf("scanning table rows: %w", err)
 	}
@@ -238,7 +238,7 @@ func (sc *SchemaCatalog) DropTable(tableName string) error {
 	}
 
 	//get rid of schema row
-	if err := sc.bt.Delete(encodeKey(0, tableId)); err != nil {
+	if err := sc.bt.Delete(EncodeKey(0, tableId)); err != nil {
 		return fmt.Errorf("failed to delete table: %w", err)
 	}
 

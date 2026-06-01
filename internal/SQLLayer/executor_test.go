@@ -188,11 +188,11 @@ func TestLiteralMatchesType_CaseInsensitiveDataType(t *testing.T) {
 	}
 }
 
-// ---- literalToField ----
+// ---- LiteralToField ----
 
 func TestLiteralToField_Int(t *testing.T) {
 	lit := Literal{Value: "99", Type: TOKEN_NUMBER}
-	f, err := literalToField(lit, "INT", 1)
+	f, err := LiteralToField(lit, "INT", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestLiteralToField_Int(t *testing.T) {
 
 func TestLiteralToField_Text(t *testing.T) {
 	lit := Literal{Value: "alice", Type: TOKEN_STRING}
-	f, err := literalToField(lit, "TEXT", 2)
+	f, err := LiteralToField(lit, "TEXT", 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestLiteralToField_Text(t *testing.T) {
 
 func TestLiteralToField_Bool(t *testing.T) {
 	lit := Literal{Value: "true", Type: TOKEN_IDENTIFIER}
-	f, err := literalToField(lit, "BOOL", 3)
+	f, err := LiteralToField(lit, "BOOL", 3)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestLiteralToField_Bool(t *testing.T) {
 
 func TestLiteralToField_TypeMismatch(t *testing.T) {
 	lit := Literal{Value: "hello", Type: TOKEN_STRING}
-	_, err := literalToField(lit, "INT", 0)
+	_, err := LiteralToField(lit, "INT", 0)
 	if err == nil {
 		t.Error("expected error for type mismatch")
 	}
@@ -237,20 +237,20 @@ func TestLiteralToField_TypeMismatch(t *testing.T) {
 func TestLiteralToField_InvalidIntLiteral(t *testing.T) {
 	// Bypass literalMatchesType by giving a NUMBER token but an unparseable value.
 	lit := Literal{Value: "not_a_number", Type: TOKEN_NUMBER}
-	_, err := literalToField(lit, "INT", 0)
+	_, err := LiteralToField(lit, "INT", 0)
 	if err == nil {
 		t.Error("expected error for unparseable INT literal")
 	}
 }
 
-// ---- findColumnIndex ----
+// ---- FindColumnIndex ----
 
 func TestFindColumnIndex_PrimaryKey(t *testing.T) {
 	schema := &TableSchemaValue{
 		PrimaryKey: ColumnDef{Name: "id", DataType: "INT"},
 		Columns:    []ColumnDef{{Name: "name", DataType: "TEXT"}},
 	}
-	if got := findColumnIndex("id", schema); got != 0 {
+	if got := FindColumnIndex("id", schema); got != 0 {
 		t.Errorf("PK index: got %d, want 0", got)
 	}
 }
@@ -260,10 +260,10 @@ func TestFindColumnIndex_Column(t *testing.T) {
 		PrimaryKey: ColumnDef{Name: "id", DataType: "INT"},
 		Columns:    []ColumnDef{{Name: "name", DataType: "TEXT"}, {Name: "age", DataType: "INT"}},
 	}
-	if got := findColumnIndex("name", schema); got != 1 {
+	if got := FindColumnIndex("name", schema); got != 1 {
 		t.Errorf("name index: got %d, want 1", got)
 	}
-	if got := findColumnIndex("age", schema); got != 2 {
+	if got := FindColumnIndex("age", schema); got != 2 {
 		t.Errorf("age index: got %d, want 2", got)
 	}
 }
@@ -273,10 +273,10 @@ func TestFindColumnIndex_CaseInsensitive(t *testing.T) {
 		PrimaryKey: ColumnDef{Name: "ID", DataType: "INT"},
 		Columns:    []ColumnDef{{Name: "Name", DataType: "TEXT"}},
 	}
-	if got := findColumnIndex("id", schema); got != 0 {
+	if got := FindColumnIndex("id", schema); got != 0 {
 		t.Errorf("PK case-insensitive: got %d, want 0", got)
 	}
-	if got := findColumnIndex("NAME", schema); got != 1 {
+	if got := FindColumnIndex("NAME", schema); got != 1 {
 		t.Errorf("column case-insensitive: got %d, want 1", got)
 	}
 }
@@ -286,7 +286,7 @@ func TestFindColumnIndex_NotFound(t *testing.T) {
 		PrimaryKey: ColumnDef{Name: "id", DataType: "INT"},
 		Columns:    []ColumnDef{{Name: "name", DataType: "TEXT"}},
 	}
-	if got := findColumnIndex("missing", schema); got != -1 {
+	if got := FindColumnIndex("missing", schema); got != -1 {
 		t.Errorf("missing column: got %d, want -1", got)
 	}
 }
@@ -585,7 +585,7 @@ func TestExecuteDrop_RemovesDataRows(t *testing.T) {
 
 	tableId := ex.sc.FindTableSchema("users").TableId
 	mustExecSQL(t, ex, "DROP TABLE users")
-	assertRangeScanCount(t, ex.bt, encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)), 0)
+	assertRangeScanCount(t, ex.bt, EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)), 0)
 }
 
 func TestExecuteDrop_CanRecreateAfterDrop(t *testing.T) {
@@ -608,7 +608,7 @@ func TestExecuteInsert_Success(t *testing.T) {
 	mustExecSQL(t, ex, "INSERT INTO users VALUES (1, 'alice', 30)")
 
 	tableId := ex.sc.FindTableSchema("users").TableId
-	assertKeyPresent(t, ex.bt, encodeKey(tableId, 1))
+	assertKeyPresent(t, ex.bt, EncodeKey(tableId, 1))
 }
 
 func TestExecuteInsert_TableNotFound(t *testing.T) {
@@ -968,7 +968,7 @@ func TestExecuteDelete_Success(t *testing.T) {
 	mustExecSQL(t, ex, "DELETE FROM users WHERE id = 1")
 
 	tableId := ex.sc.FindTableSchema("users").TableId
-	assertKeyAbsent(t, ex.bt, encodeKey(tableId, 1))
+	assertKeyAbsent(t, ex.bt, EncodeKey(tableId, 1))
 }
 
 func TestExecuteDelete_TableNotFound(t *testing.T) {
@@ -1309,7 +1309,7 @@ func TestInsertLock_BlocksOtherExclusiveUntilCommit(t *testing.T) {
 	txn1 := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn1.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 
-	key := encodeKey(schema.TableId, 1)
+	key := EncodeKey(schema.TableId, 1)
 	txn2 := ex.tm.Begin()
 	acquired := make(chan struct{})
 	go func() {
@@ -1339,7 +1339,7 @@ func TestInsertLock_ReleasedOnRollback(t *testing.T) {
 	txn1 := ex.tm.Begin()
 	mustExecInTxn(t, ex, txn1.Id, "INSERT INTO users VALUES (1, 'alice', 30)")
 
-	key := encodeKey(schema.TableId, 1)
+	key := EncodeKey(schema.TableId, 1)
 	txn2 := ex.tm.Begin()
 	acquired := make(chan struct{})
 	go func() {
