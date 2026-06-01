@@ -20,9 +20,11 @@ import (
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
+	"github.com/your-username/DistributedDatabaseSystem/internal/partition"
 	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 	pb "github.com/your-username/DistributedDatabaseSystem/proto/db"
 	raftpb "github.com/your-username/DistributedDatabaseSystem/proto/raft"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type server struct {
@@ -30,6 +32,7 @@ type server struct {
 	tm *lock.TransactionManager
 	ex *sqllayer.Executor
 	sc *sqllayer.SchemaCatalog
+	gw *partition.Gateway // non-nil in Raft mode; routes via RangeService
 }
 
 type raftServiceServer struct {
@@ -99,10 +102,20 @@ func (s *server) Execute(ctx context.Context, req *pb.SQLRequest) (*pb.SQLRespon
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "tokenize: %v", err)
 	}
-
 	stmt, err := sqllayer.Parse(tokens)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "parse: %v", err)
+	}
+
+	if s.gw != nil {
+		result, err := s.gw.Execute(stmt)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "gateway: %v", err)
+		}
+		if result == nil {
+			return &pb.SQLResponse{}, nil
+		}
+		return partitionResultSetToProto(result), nil
 	}
 
 	txn := s.tm.Begin()
@@ -112,16 +125,29 @@ func (s *server) Execute(ctx context.Context, req *pb.SQLRequest) (*pb.SQLRespon
 		return nil, status.Errorf(codes.Internal, "execute: %v", err)
 	}
 	if err := s.tm.Commit(txn.Id); err != nil {
-		// CREATE TABLE reserves a table ID in maxTableId before Propose. On failure
-		// reload schemas so maxTableId is reset to the last committed value.
 		_ = s.sc.LoadSchemas()
 		return nil, status.Errorf(codes.Internal, "commit: %v", err)
 	}
-
 	if result == nil {
 		return &pb.SQLResponse{}, nil
 	}
 	return resultSetToProto(result), nil
+}
+
+func partitionResultSetToProto(rs *partition.ResultSet) *pb.SQLResponse {
+	resp := &pb.SQLResponse{Columns: rs.Columns}
+	for _, row := range rs.Rows {
+		pbRow := &pb.ResultRow{}
+		colType := ""
+		for i, f := range row.Fields {
+			if i < len(rs.ColTypes) {
+				colType = rs.ColTypes[i]
+			}
+			pbRow.Fields = append(pbRow.Fields, fieldToProto(f, colType))
+		}
+		resp.Rows = append(resp.Rows, pbRow)
+	}
+	return resp
 }
 
 func parsePeers(s string) (map[uint64]string, error) {
@@ -157,7 +183,8 @@ func main() {
 	port := flag.String("port", "5555", "port to listen on for SQL")
 	raftPort := flag.String("raft-port", "5556", "port to listen on for Raft RPC")
 	nodeID := flag.Uint64("id", 0, "this node's Raft ID (0 = standalone, no Raft)")
-	peersFlag := flag.String("peers", "", "comma-separated peer list: id=addr,id=addr (e.g. 2=localhost:5556)")
+	peersFlag := flag.String("peers", "", "comma-separated peer list: id=addr,id=addr (e.g. 2=192.168.1.2:5556)")
+	advertiseAddr := flag.String("advertise-addr", "", "address peers use to reach this node's Raft port (e.g. 192.168.1.1:5556); defaults to localhost:<raft-port>")
 	flag.Parse()
 
 	if *dbPath == "" {
@@ -223,7 +250,72 @@ func main() {
 		rn.SetApplyHook(applyFn)
 	}
 
-	srv := &server{tm: tm, ex: ex, sc: sc}
+	// Partition layer — only active in Raft mode.
+	var gw *partition.Gateway
+	if rn != nil {
+		peers, _ := parsePeers(*peersFlag)
+
+		// Build the full node map (peers + self) for the coordinator.
+		allNodes := make(map[uint64]string, len(peers)+1)
+		for id, addr := range peers {
+			allNodes[id] = addr
+		}
+		self := *advertiseAddr
+		if self == "" {
+			self = "localhost:" + *raftPort
+		}
+		allNodes[*nodeID] = self
+
+		coordinator, err := partition.NewCoordinator(allNodes), error(nil)
+		_ = err // NewCoordinator does not return an error
+		router, err := partition.NewRouter(coordinator)
+		if err != nil {
+			log.Fatalf("create router: %v", err)
+		}
+		gw = partition.NewGateway(router, sc)
+
+		// Populate gateway connections — one per peer, plus self.
+		for id, conn := range rn.PeerConns() {
+			gw.AddConn(id, conn)
+		}
+		selfConn, err := grpc.NewClient(
+			"localhost:"+*raftPort,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			log.Fatalf("dial self: %v", err)
+		}
+		gw.AddConn(*nodeID, selfConn)
+
+		// Register split-trigger hooks on the Raft node.
+		rn.SetRangeLookup(func(key uint64) (rangeID, startKey, endKey uint64, found bool) {
+			rd := coordinator.LookupKey(key)
+			if rd == nil {
+				return 0, 0, 0, false
+			}
+			return rd.RangeID, rd.StartKey, rd.EndKey, true
+		})
+		rn.SetSplitHook(func(rangeID, splitKey uint64) error {
+			return coordinator.RequestSplit(rangeID, splitKey)
+		})
+		rn.SetLeaderRangesFunc(func() []raft.RangeInfo {
+			all := coordinator.GetAllRanges()
+			out := make([]raft.RangeInfo, 0, len(all))
+			for _, rd := range all {
+				if rd.LeaderID == *nodeID {
+					out = append(out, raft.RangeInfo{
+						RangeID:  rd.RangeID,
+						StartKey: rd.StartKey,
+						EndKey:   rd.EndKey,
+						LeaderID: rd.LeaderID,
+					})
+				}
+			}
+			return out
+		})
+	}
+
+	srv := &server{tm: tm, ex: ex, sc: sc, gw: gw}
 
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {

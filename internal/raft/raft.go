@@ -55,6 +55,26 @@ type Proposal struct {
 	Result  chan error
 }
 
+// RangeInfo is a snapshot of a single range's key bounds and leadership,
+// used to avoid importing the partition package from raft.
+type RangeInfo struct {
+	RangeID  uint64
+	StartKey uint64
+	EndKey   uint64
+	LeaderID uint64
+}
+
+// rangeStatsEntry tracks approximate size and row-count for one range.
+type rangeStatsEntry struct {
+	keyCount   uint64
+	totalBytes uint64
+}
+
+const (
+	maxKeysPerRange    = 1000
+	minRangeSplitBytes = 1 << 20 // 1 MB
+)
+
 type RaftNode struct {
 	mu sync.Mutex
 
@@ -76,20 +96,33 @@ type RaftNode struct {
 	matchIndex map[uint64]uint64
 
 	// Infrastructure
-	bt            *btree.BTree
-	applyHook     func(op ReplOp, key uint64, fields []btree.Field) error
-	proposalCh    chan Proposal
-	electionTimer *time.Timer
-	heartbeatTick *time.Ticker
-	peerClients   map[uint64]pb.RaftServiceClient
-	pendingProps  map[uint64]chan error //log index -> result channel
-	stopCh        chan struct{}
-	stopOnce      sync.Once
+	bt        *btree.BTree
+	applyHook func(op ReplOp, key uint64, fields []btree.Field) error
+
+	// Split trigger — wired via Set* methods to avoid importing partition.
+	splitFn        func(rangeID uint64, splitKey uint64) error
+	rangeLookupFn  func(key uint64) (rangeID, startKey, endKey uint64, found bool)
+	leaderRangesFn func() []RangeInfo
+	rangeStats     map[uint64]*rangeStatsEntry
+	proposalCh     chan Proposal
+	electionTimer  *time.Timer
+	heartbeatTick  *time.Ticker
+	peerClients    map[uint64]pb.RaftServiceClient
+	peerConns      map[uint64]*grpc.ClientConn
+	pendingProps   map[uint64]chan error //log index -> result channel
+	stopCh         chan struct{}
+	stopOnce       sync.Once
 }
 
 // Stop shuts down the node's Run loop. Safe to call multiple times.
 func (rn *RaftNode) Stop() {
 	rn.stopOnce.Do(func() { close(rn.stopCh) })
+}
+
+// PeerConns returns the raw gRPC connections to every peer, keyed by node ID.
+// Callers may wrap these in additional service clients without opening new dials.
+func (rn *RaftNode) PeerConns() map[uint64]*grpc.ClientConn {
+	return rn.peerConns
 }
 
 // IsLeader reports whether this node currently believes itself to be the leader.
@@ -110,6 +143,7 @@ func (rn *RaftNode) SetApplyHook(fn func(op ReplOp, key uint64, fields []btree.F
 func NewRaftNode(id uint64, peersAddr map[uint64]string, bt *btree.BTree) (*RaftNode, error) {
 	peers := make([]uint64, 0, len(peersAddr))
 	peerClients := make(map[uint64]pb.RaftServiceClient, len(peersAddr))
+	peerConns := make(map[uint64]*grpc.ClientConn, len(peersAddr))
 
 	for peerID, addr := range peersAddr {
 		peers = append(peers, peerID)
@@ -117,6 +151,7 @@ func NewRaftNode(id uint64, peersAddr map[uint64]string, bt *btree.BTree) (*Raft
 		if err != nil {
 			return nil, fmt.Errorf("dial peer %d at %s: %w", peerID, addr, err)
 		}
+		peerConns[peerID] = conn
 		peerClients[peerID] = pb.NewRaftServiceClient(conn)
 	}
 
@@ -128,6 +163,7 @@ func NewRaftNode(id uint64, peersAddr map[uint64]string, bt *btree.BTree) (*Raft
 		peers:         peers,
 		peersAddr:     peersAddr,
 		peerClients:   peerClients,
+		peerConns:     peerConns,
 		nextIndex:     make(map[uint64]uint64),
 		matchIndex:    make(map[uint64]uint64),
 		pendingProps:  make(map[uint64]chan error),
@@ -136,7 +172,109 @@ func NewRaftNode(id uint64, peersAddr map[uint64]string, bt *btree.BTree) (*Raft
 		heartbeatTick: time.NewTicker(HeartbeatInterval * time.Millisecond),
 		bt:            bt,
 		stopCh:        make(chan struct{}),
+		rangeStats:    make(map[uint64]*rangeStatsEntry),
 	}, nil
+}
+
+// SetSplitHook registers the function called when a range exceeds the split
+// threshold. fn should call coordinator.RequestSplit.
+func (rn *RaftNode) SetSplitHook(fn func(rangeID uint64, splitKey uint64) error) {
+	rn.splitFn = fn
+}
+
+// SetRangeLookup registers a function that maps a BTree key to its range's
+// ID and key bounds. fn should delegate to coordinator.LookupKey.
+func (rn *RaftNode) SetRangeLookup(fn func(key uint64) (rangeID, startKey, endKey uint64, found bool)) {
+	rn.rangeLookupFn = fn
+}
+
+// SetLeaderRangesFunc registers a function that returns the ranges this node
+// currently leads. fn should filter coordinator.GetAllRanges by LeaderID.
+func (rn *RaftNode) SetLeaderRangesFunc(fn func() []RangeInfo) {
+	rn.leaderRangesFn = fn
+}
+
+// updateRangeStats updates approximate per-range key-count and byte stats for
+// one log entry. Must be called before the entry is applied to the BTree so
+// that bt.Search reflects pre-apply state.
+func (rn *RaftNode) updateRangeStats(entry RaftLogEntry) {
+	if rn.rangeLookupFn == nil {
+		return
+	}
+	rangeID, _, _, ok := rn.rangeLookupFn(entry.Command.Key)
+	if !ok {
+		return
+	}
+	stats := rn.rangeStats[rangeID]
+	if stats == nil {
+		stats = &rangeStatsEntry{}
+		rn.rangeStats[rangeID] = stats
+	}
+	newSize := estimateRowSize(entry.Command.Fields)
+	switch entry.Command.Op {
+	case ReplPut:
+		existing, found, err := rn.bt.Search(entry.Command.Key)
+		if err == nil && !found {
+			stats.keyCount++
+			stats.totalBytes += newSize
+		} else if err == nil && found {
+			oldSize := estimateRowSize(existing)
+			if newSize >= oldSize {
+				stats.totalBytes += newSize - oldSize
+			} else {
+				stats.totalBytes -= oldSize - newSize
+			}
+		}
+	case ReplDelete:
+		if stats.keyCount > 0 {
+			stats.keyCount--
+		}
+		if stats.totalBytes >= newSize {
+			stats.totalBytes -= newSize
+		}
+	}
+}
+
+// checkSplit checks every range this node leads and requests a split at the
+// median key if both the key-count and byte thresholds are exceeded.
+// Called from applyCommitted while holding rn.mu; the BTree scan is the
+// expensive part — consider moving to a background goroutine in production.
+func (rn *RaftNode) checkSplit() {
+	if rn.splitFn == nil || rn.leaderRangesFn == nil {
+		return
+	}
+	for _, ri := range rn.leaderRangesFn() {
+		stats := rn.rangeStats[ri.RangeID]
+		if stats == nil {
+			continue
+		}
+		if stats.keyCount <= maxKeysPerRange || stats.totalBytes <= minRangeSplitBytes {
+			continue
+		}
+		rows, err := rn.bt.RangeScan(ri.StartKey, ri.EndKey)
+		if err != nil || len(rows) < 2 {
+			continue
+		}
+		medianKey := rows[len(rows)/2].Key
+		if err := rn.splitFn(ri.RangeID, medianKey); err != nil {
+			log.Printf("raft: split range %d at key %d: %v", ri.RangeID, medianKey, err)
+		}
+	}
+}
+
+func estimateRowSize(fields []btree.Field) uint64 {
+	var size uint64
+	for _, f := range fields {
+		switch v := f.Value.(type) {
+		case btree.IntValue:
+			size += 8
+		case btree.StringValue:
+			size += uint64(len(v.V))
+		default:
+			size += 8
+		}
+	}
+	return size
 }
 
 func (rn *RaftNode) Propose(commands []RaftCommand) error {
@@ -400,6 +538,9 @@ func (rn *RaftNode) applyCommitted() {
 		rn.lastApplied++
 		entry := rn.log[rn.lastApplied-1]
 
+		// Update range stats before applying so bt.Search reflects pre-apply state.
+		rn.updateRangeStats(entry)
+
 		// Apply to the local state machine on every node — leader and follower alike.
 		// The executor no longer writes to the BTree before Propose, so the leader
 		// must go through the same apply path as followers.
@@ -428,6 +569,10 @@ func (rn *RaftNode) applyCommitted() {
 			}
 			delete(rn.pendingProps, entry.Index)
 		}
+	}
+
+	if rn.state == RaftStateLeader {
+		rn.checkSplit()
 	}
 }
 

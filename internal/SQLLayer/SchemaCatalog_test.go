@@ -35,7 +35,7 @@ func insertSchemaRow(t *testing.T, bt *btree.BTree, tableId uint32, tableName, p
 		{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: nameElems}},
 		{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: typeElems}},
 	}
-	if err := bt.Insert(encodeKey(0, tableId), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, tableId), fields); err != nil {
 		t.Fatalf("insertSchemaRow(tableId=%d): %v", tableId, err)
 	}
 }
@@ -180,7 +180,7 @@ func TestLoadSchemas_TooFewFields(t *testing.T) {
 		{Tag: 1, Value: btree.StringValue{V: "users"}},
 		{Tag: 2, Value: btree.StringValue{V: "id"}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	sc := NewSchemaCatalog(bt)
@@ -199,7 +199,7 @@ func TestLoadSchemas_BadTableNameType(t *testing.T) {
 		{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 		{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -217,7 +217,7 @@ func TestLoadSchemas_BadPKNameType(t *testing.T) {
 		{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 		{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -235,7 +235,7 @@ func TestLoadSchemas_BadPKTypeType(t *testing.T) {
 		{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 		{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: empty}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -252,7 +252,7 @@ func TestLoadSchemas_BadColumnNamesType(t *testing.T) {
 		{Tag: 4, Value: btree.IntValue{V: 99}}, // should be ListValue
 		{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: []btree.Value{}}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -269,7 +269,7 @@ func TestLoadSchemas_BadColumnTypesType(t *testing.T) {
 		{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: []btree.Value{}}},
 		{Tag: 5, Value: btree.IntValue{V: 99}}, // should be ListValue
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -291,7 +291,7 @@ func TestLoadSchemas_ColumnCountMismatch(t *testing.T) {
 			btree.StringValue{V: "TEXT"}, // 1 type for 2 names
 		}}},
 	}
-	if err := bt.Insert(encodeKey(0, 1), fields); err != nil {
+	if err := bt.Insert(EncodeKey(0, 1), fields); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if err := NewSchemaCatalog(bt).LoadSchemas(); err == nil {
@@ -408,7 +408,7 @@ func TestCreateTable_DoesNotPolluteCacheOnBTreeError(t *testing.T) {
 
 	// Manually insert the key for the *next* table ID so the second CreateTable's
 	// bt.Insert collides and fails. This simulates a BTree write error.
-	nextKey := encodeKey(0, firstId+1)
+	nextKey := EncodeKey(0, firstId+1)
 	_ = bt.Insert(nextKey, []btree.Field{{Tag: 1, Value: btree.StringValue{V: "blocker"}}})
 
 	// This CreateTable should fail at the BTree Insert step.
@@ -455,12 +455,12 @@ func TestDropTable_RemovesSchemaRow(t *testing.T) {
 		t.Fatalf("CreateTable: %v", err)
 	}
 	tableId := sc.FindTableSchema("users").TableId
-	assertKeyPresent(t, bt, encodeKey(0, tableId))
+	assertKeyPresent(t, bt, EncodeKey(0, tableId))
 
 	if err := sc.DropTable("users"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
-	assertKeyAbsent(t, bt, encodeKey(0, tableId))
+	assertKeyAbsent(t, bt, EncodeKey(0, tableId))
 }
 
 func TestDropTable_RemovesDataRows(t *testing.T) {
@@ -474,16 +474,16 @@ func TestDropTable_RemovesDataRows(t *testing.T) {
 
 	dataFields := []btree.Field{{Tag: 1, Value: btree.StringValue{V: "Alice"}}}
 	for _, pk := range []uint32{100, 200, 300} {
-		if err := bt.Insert(encodeKey(tableId, pk), dataFields); err != nil {
+		if err := bt.Insert(EncodeKey(tableId, pk), dataFields); err != nil {
 			t.Fatalf("Insert data row pk=%d: %v", pk, err)
 		}
 	}
-	assertRangeScanCount(t, bt, encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)), 3)
+	assertRangeScanCount(t, bt, EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)), 3)
 
 	if err := sc.DropTable("users"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
-	assertRangeScanCount(t, bt, encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)), 0)
+	assertRangeScanCount(t, bt, EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)), 0)
 }
 
 func TestDropTable_NoDataRows(t *testing.T) {
@@ -511,7 +511,7 @@ func TestDropTable_MultipleDataRowsPurged(t *testing.T) {
 	tableId := sc.FindTableSchema("logs").TableId
 	dataFields := []btree.Field{{Tag: 1, Value: btree.IntValue{V: 42}}}
 	for pk := uint32(1); pk <= 10; pk++ {
-		if err := bt.Insert(encodeKey(tableId, pk), dataFields); err != nil {
+		if err := bt.Insert(EncodeKey(tableId, pk), dataFields); err != nil {
 			t.Fatalf("Insert pk=%d: %v", pk, err)
 		}
 	}
@@ -519,7 +519,7 @@ func TestDropTable_MultipleDataRowsPurged(t *testing.T) {
 	if err := sc.DropTable("logs"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
-	assertRangeScanCount(t, bt, encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)), 0)
+	assertRangeScanCount(t, bt, EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)), 0)
 }
 
 func TestDropTable_ReuseNameAfterDrop(t *testing.T) {
@@ -580,7 +580,7 @@ func TestDropTable_DoesNotAffectOtherTables(t *testing.T) {
 	// "keep" must still exist with its original schema.
 	assertSchemaEqual(t, sc.FindTableSchema("keep"), 1, "id", "INT",
 		[]ColumnDef{{Name: "x", DataType: "INT"}})
-	assertKeyPresent(t, bt, encodeKey(0, 1))
+	assertKeyPresent(t, bt, EncodeKey(0, 1))
 }
 
 // ---- FindTableSchema ----

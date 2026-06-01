@@ -1,0 +1,70 @@
+syntax = "proto3";
+package rangeservice;
+option go_package = "github.com/your-username/DistributedDatabaseSystem/proto/rangeservice;rangeservice";
+
+enum RangeOp {
+    SCAN   = 0;
+    INSERT = 1;
+    UPDATE = 2;
+    DELETE = 3;
+}
+
+// Field mirrors btree.Field: a tag plus a typed value.
+message FieldValue {
+    oneof value {
+        int64  int_val = 1;
+        string str_val = 2;
+    }
+}
+
+message Field {
+    uint32     tag   = 1;
+    FieldValue value = 2;
+}
+
+// Expression encodes a sqllayer WHERE tree.
+message ComparisonExpr {
+    string column        = 1;
+    string operator      = 2;
+    string literal_value = 3;
+    int32  literal_type  = 4; // sqllayer.TokenType
+}
+
+message LogicalExpr {
+    string     operator = 1;
+    Expression left     = 2;
+    Expression right    = 3;
+}
+
+message Expression {
+    oneof expr {
+        ComparisonExpr comparison = 1;
+        LogicalExpr    logical    = 2;
+    }
+}
+
+message RangeRequest {
+    RangeOp          op         = 1;
+    uint32           table_id   = 2;
+    uint64           start_key  = 3;
+    uint64           end_key    = 4;
+    uint64           key        = 5;  // INSERT: exact row key
+    repeated Field   fields     = 6;  // INSERT: row data; UPDATE: new value
+    Expression       where      = 7;  // SELECT/UPDATE/DELETE filter
+    repeated int32   columns    = 8;  // SELECT: projection indices
+    int32            update_col = 9;  // UPDATE: column index to set
+}
+
+message ResultRow {
+    uint64         key    = 1;
+    repeated Field fields = 2;
+}
+
+message RangeResponse {
+    repeated ResultRow rows  = 1;
+    string             error = 2;
+}
+
+service RangeService {
+    rpc Execute(RangeRequest) returns (RangeResponse);
+}

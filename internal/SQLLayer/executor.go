@@ -51,8 +51,8 @@ func literalMatchesType(lit Literal, dataType string) bool {
 	return false
 }
 
-// literalToField converts a literal statement to a btree field
-func literalToField(lit Literal, dataType string, tag uint8) (btree.Field, error) {
+// LiteralToField converts a literal statement to a btree field
+func LiteralToField(lit Literal, dataType string, tag uint8) (btree.Field, error) {
 	if ok := literalMatchesType(lit, dataType); !ok {
 		return btree.Field{}, fmt.Errorf("Literal type mismatch")
 	}
@@ -88,18 +88,18 @@ func literalToField(lit Literal, dataType string, tag uint8) (btree.Field, error
 	return btree.Field{}, fmt.Errorf("incompatible field: %q", dataType)
 }
 
-// literalToPrimaryKey converts literal value into primary key
-func literalToPrimaryKey(lit Literal) (uint32, error) {
+// LiteralToPrimaryKey converts literal value into primary key
+func LiteralToPrimaryKey(lit Literal) (uint32, error) {
 	key, err := strconv.ParseUint(lit.Value, 10, 32)
 
 	return uint32(key), err
 }
 
-// findColumnIndex returns the index into the full fields slice for colName.
+// FindColumnIndex returns the index into the full fields slice for colName.
 // The fields slice is ordered as [PrimaryKey, Columns[0], Columns[1], ...],
 // so PrimaryKey maps to index 0 and schema.Columns[i] maps to index i+1.
 // Returns -1 if the column does not exist in the schema.
-func findColumnIndex(colName string, schema *TableSchemaValue) int {
+func FindColumnIndex(colName string, schema *TableSchemaValue) int {
 	if strings.EqualFold(colName, schema.PrimaryKey.Name) {
 		return 0
 	}
@@ -150,14 +150,14 @@ func compareString(a, b string, op string) bool {
 }
 
 // evaluateExpression evaluates a WHERE expression against a row.
-// fields must be ordered as [PrimaryKey, Columns[0], Columns[1], ...] to match findColumnIndex.
+// fields must be ordered as [PrimaryKey, Columns[0], Columns[1], ...] to match FindColumnIndex.
 func evaluateExpression(expr Expression, schema *TableSchemaValue, fields []btree.Field) bool {
 	if expr == nil {
 		return true
 	}
 	switch e := expr.(type) {
 	case *ComparisonExpr:
-		idx := findColumnIndex(e.Column, schema)
+		idx := FindColumnIndex(e.Column, schema)
 		if idx == -1 {
 			return false
 		}
@@ -219,12 +219,12 @@ func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet,
 		return nil, fmt.Errorf("table %q has too many columns (%d); maximum is 255", s.Table, len(schema.Columns))
 	}
 
-	pkValue, err := literalToPrimaryKey(s.Values[0])
+	pkValue, err := LiteralToPrimaryKey(s.Values[0])
 	if err != nil {
 		return nil, fmt.Errorf("unable to convert literal to primary key: %w", err)
 	}
 
-	encodedKey := encodeKey(schema.TableId, pkValue)
+	encodedKey := EncodeKey(schema.TableId, pkValue)
 
 	if err := ex.tm.Lock(txnId, encodedKey, lock.LockExclusive); err != nil {
 		return nil, fmt.Errorf("lock row %d: %w", encodedKey, err)
@@ -239,14 +239,14 @@ func (ex *Executor) executeInsert(s *InsertStatement, txnId uint64) (*ResultSet,
 	}
 
 	// Primary key goes into fields[0]
-	pkField, err := literalToField(s.Values[0], schema.PrimaryKey.DataType, 0)
+	pkField, err := LiteralToField(s.Values[0], schema.PrimaryKey.DataType, 0)
 	if err != nil {
 		return nil, fmt.Errorf("primary key: %w", err)
 	}
 	fields := []btree.Field{pkField}
 
 	for i := range len(schema.Columns) {
-		field, err := literalToField(s.Values[i+1], schema.Columns[i].DataType, uint8(i+1))
+		field, err := LiteralToField(s.Values[i+1], schema.Columns[i].DataType, uint8(i+1))
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", schema.Columns[i].Name, err)
 		}
@@ -283,7 +283,7 @@ func (ex *Executor) executeSelect(s *SelectStatement, txnId uint64) (*ResultSet,
 		}
 	} else {
 		for _, col := range s.Columns {
-			idx := findColumnIndex(col, schema)
+			idx := FindColumnIndex(col, schema)
 			if idx == -1 {
 				return nil, fmt.Errorf("column %q not found in table %q", col, s.Table)
 			}
@@ -303,7 +303,7 @@ func (ex *Executor) executeSelect(s *SelectStatement, txnId uint64) (*ResultSet,
 		}
 	}
 
-	results, err := ex.bt.RangeScan(encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)))
+	results, err := ex.bt.RangeScan(EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)))
 	if err != nil {
 		return nil, fmt.Errorf("range scan over table %d: %w", tableId, err)
 	}
@@ -360,7 +360,7 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 	}
 
 	tableId := schema.TableId
-	results, err := ex.bt.RangeScan(encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)))
+	results, err := ex.bt.RangeScan(EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)))
 	if err != nil {
 		return nil, fmt.Errorf("range scan over table %d: %w", tableId, err)
 	}
@@ -380,11 +380,11 @@ func (ex *Executor) executeUpdate(s *UpdateStatement, txnId uint64) (*ResultSet,
 			continue
 		}
 
-		i := findColumnIndex(s.Column, schema)
+		i := FindColumnIndex(s.Column, schema)
 		if i <= 0 {
 			return nil, fmt.Errorf("column %q not found in schema", s.Column)
 		}
-		newField, err := literalToField(s.Value, schema.Columns[i-1].DataType, uint8(i))
+		newField, err := LiteralToField(s.Value, schema.Columns[i-1].DataType, uint8(i))
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", s.Column, err)
 		}
@@ -411,7 +411,7 @@ func (ex *Executor) executeDelete(s *DeleteStatement, txnId uint64) (*ResultSet,
 	defer mu.Unlock()
 
 	tableId := schema.TableId
-	results, err := ex.bt.RangeScan(encodeKey(tableId, 0), encodeKey(tableId, ^uint32(0)))
+	results, err := ex.bt.RangeScan(EncodeKey(tableId, 0), EncodeKey(tableId, ^uint32(0)))
 	if err != nil {
 		return nil, fmt.Errorf("range scan over table %d: %w", tableId, err)
 	}
@@ -468,12 +468,12 @@ func (ex *Executor) executeDrop(s *DropTableStatement, txnId uint64) (*ResultSet
 		return nil, fmt.Errorf("table %q does not exist", s.Table)
 	}
 
-	schemaKey := encodeKey(0, schema.TableId)
+	schemaKey := EncodeKey(0, schema.TableId)
 	if err := ex.tm.Lock(txnId, schemaKey, lock.LockExclusive); err != nil {
 		return nil, fmt.Errorf("lock schema key: %w", err)
 	}
 
-	dataRows, err := ex.bt.RangeScan(encodeKey(schema.TableId, 0), encodeKey(schema.TableId, ^uint32(0)))
+	dataRows, err := ex.bt.RangeScan(EncodeKey(schema.TableId, 0), EncodeKey(schema.TableId, ^uint32(0)))
 	if err != nil {
 		return nil, fmt.Errorf("scan table %q for drop: %w", s.Table, err)
 	}
