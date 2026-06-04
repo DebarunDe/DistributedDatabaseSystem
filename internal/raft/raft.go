@@ -208,6 +208,7 @@ func (rn *RaftNode) SetLeaderChangeHook(fn func(leaderID uint64)) {
 	rn.leaderChangeFn = fn
 }
 
+
 // updateRangeStats updates approximate per-range key-count and byte stats for
 // one log entry. Must be called before the entry is applied to the BTree so
 // that bt.Search reflects pre-apply state.
