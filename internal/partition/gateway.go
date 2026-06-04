@@ -19,6 +19,7 @@ type Gateway struct {
 	router *Router
 	schema *sqllayer.SchemaCatalog
 	conns  map[uint64]*grpc.ClientConn
+	dtm    *DistributedTxnManager
 }
 
 // AddConn registers a gRPC connection to nodeID's RangeService port.
@@ -27,11 +28,13 @@ func (gw *Gateway) AddConn(nodeID uint64, conn *grpc.ClientConn) {
 }
 
 func NewGateway(router *Router, schema *sqllayer.SchemaCatalog) *Gateway {
-	return &Gateway{
+	gw := &Gateway{
 		router: router,
 		schema: schema,
 		conns:  make(map[uint64]*grpc.ClientConn),
 	}
+	gw.dtm = NewDistributedTxnManager(gw)
+	return gw
 }
 
 func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
@@ -72,6 +75,17 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 		if schema == nil {
 			return nil, fmt.Errorf("table %q not found", s.Table)
 		}
+
+		// Expand SELECT * to the full ordered column list.
+		colNames := s.Columns
+		if len(colNames) == 1 && colNames[0] == "*" {
+			colNames = make([]string, 1+len(schema.Columns))
+			colNames[0] = schema.PrimaryKey.Name
+			for i, c := range schema.Columns {
+				colNames[i+1] = c.Name
+			}
+		}
+
 		low, high := extractPKBounds(s.Where, schema.PrimaryKey.Name)
 		startKey := sqllayer.EncodeKey(schema.TableId, low)
 		endKey := sqllayer.EncodeKey(schema.TableId, high) // inclusive for scans
@@ -80,16 +94,18 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("route select: %w", err)
 		}
-		cols := make([]int32, len(s.Columns))
-		for i, name := range s.Columns {
+		cols := make([]int32, len(colNames))
+		for i, name := range colNames {
 			idx := sqllayer.FindColumnIndex(name, schema)
 			if idx == -1 {
 				return nil, fmt.Errorf("column %q not found in table %q", name, s.Table)
 			}
 			cols[i] = int32(idx)
 		}
+
+		var result *ResultSet
 		if len(ranges) == 1 {
-			return gw.sendToLeader(ranges[0], &rs.RangeRequest{
+			result, err = gw.sendToLeader(ranges[0], &rs.RangeRequest{
 				Op:       rs.RangeOp_SCAN,
 				TableId:  schema.TableId,
 				StartKey: startKey,
@@ -97,8 +113,20 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 				Where:    exprToProto(s.Where),
 				Columns:  cols,
 			})
+		} else {
+			result, err = gw.scatterGather(ranges, startKey, endKey, schema.TableId, cols, s.Where)
 		}
-		return gw.scatterGather(ranges, startKey, endKey, schema.TableId, cols, s.Where)
+		if err != nil {
+			return nil, err
+		}
+		// Attach column metadata so the client can render headers.
+		result.Columns = colNames
+		result.ColTypes = make([]string, len(colNames))
+		for i, name := range colNames {
+			idx := sqllayer.FindColumnIndex(name, schema)
+			result.ColTypes[i] = colTypeByIndex(idx, schema)
+		}
+		return result, nil
 
 	case *sqllayer.UpdateStatement:
 		schema := gw.schema.FindTableSchema(s.Table)
@@ -132,7 +160,12 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 		if len(ranges) == 1 {
 			return gw.sendToLeader(ranges[0], req)
 		}
-		return gw.scatterGatherMutation(ranges, startKey, endKey, req)
+		if err := gw.dtm.ExecuteDistributed(ranges, startKey, endKey,
+			buildUpdatePrepare(schema.TableId, startKey, endKey, s.Where, updateCol, field),
+		); err != nil {
+			return nil, err
+		}
+		return &ResultSet{}, nil
 
 	case *sqllayer.DeleteStatement:
 		schema := gw.schema.FindTableSchema(s.Table)
@@ -156,7 +189,12 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 		if len(ranges) == 1 {
 			return gw.sendToLeader(ranges[0], req)
 		}
-		return gw.scatterGatherMutation(ranges, startKey, endKey, req)
+		if err := gw.dtm.ExecuteDistributed(ranges, startKey, endKey,
+			buildDeletePrepare(schema.TableId, startKey, endKey, s.Where),
+		); err != nil {
+			return nil, err
+		}
+		return &ResultSet{}, nil
 
 	case *sqllayer.CreateTableStatement:
 		pk := s.Columns[0]
@@ -187,6 +225,18 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 		if tableSchema == nil {
 			return nil, fmt.Errorf("table %q not found", s.Table)
 		}
+		dataStart := sqllayer.EncodeKey(tableSchema.TableId, 0)
+		dataEnd := sqllayer.EncodeKey(tableSchema.TableId, ^uint32(0))
+		dataRanges, err := gw.router.RouteRange(dataStart, dataEnd+1)
+		if err != nil {
+			return nil, fmt.Errorf("route data ranges: %w", err)
+		}
+		// delete data atomically across all ranges before removing the schema entry
+		if err := gw.dtm.ExecuteDistributed(dataRanges, dataStart, dataEnd,
+			buildDeletePrepare(tableSchema.TableId, dataStart, dataEnd, nil),
+		); err != nil {
+			return nil, fmt.Errorf("drop table data: %w", err)
+		}
 		schemaKey := sqllayer.EncodeKey(0, tableSchema.TableId)
 		schemaDesc, err := gw.router.RouteKey(schemaKey)
 		if err != nil {
@@ -199,24 +249,6 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 			EndKey:   schemaKey + 1,
 		}); err != nil {
 			return nil, fmt.Errorf("drop schema entry: %w", err)
-		}
-		dataStart := sqllayer.EncodeKey(tableSchema.TableId, 0)
-		dataEnd := sqllayer.EncodeKey(tableSchema.TableId, ^uint32(0))
-		dataRanges, err := gw.router.RouteRange(dataStart, dataEnd+1)
-		if err != nil {
-			return nil, fmt.Errorf("route data ranges: %w", err)
-		}
-		for _, rd := range dataRanges {
-			scopedStart := max64(dataStart, rd.StartKey)
-			scopedEnd := min64(dataEnd, rd.EndKey-1) // rd.EndKey is exclusive; convert to inclusive
-			if _, err := gw.sendToLeader(rd, &rs.RangeRequest{
-				Op:       rs.RangeOp_DELETE,
-				TableId:  tableSchema.TableId,
-				StartKey: scopedStart,
-				EndKey:   scopedEnd,
-			}); err != nil {
-				return nil, fmt.Errorf("delete data in range %d: %w", rd.RangeID, err)
-			}
 		}
 		return &ResultSet{}, nil
 
@@ -271,37 +303,36 @@ func (gw *Gateway) scatterGather(
 	return merged, nil
 }
 
-// scatterGatherMutation fans an UPDATE or DELETE across ranges, scoping each
-// request's key bounds to the range's interval. Results are not merged.
-func (gw *Gateway) scatterGatherMutation(
-	ranges []*RangeDescriptor,
-	queryStart, queryEnd uint64,
-	req *rs.RangeRequest,
-) (*ResultSet, error) {
-	type result struct{ err error }
-	ch := make(chan result, len(ranges))
-
-	for _, desc := range ranges {
-		go func(desc *RangeDescriptor) {
-			_, err := gw.sendToLeader(desc, &rs.RangeRequest{
-				Op:        req.Op,
-				TableId:   req.TableId,
-				StartKey:  max64(queryStart, desc.StartKey),
-				EndKey:    min64(queryEnd, desc.EndKey-1), // desc.EndKey is exclusive; scan is inclusive
-				Where:     req.Where,
-				Fields:    req.Fields,
-				UpdateCol: req.UpdateCol,
-			})
-			ch <- result{err}
-		}(desc)
-	}
-
-	for range ranges {
-		if r := <-ch; r.err != nil {
-			return nil, r.err
+// buildUpdatePrepare returns a buildPrepare closure for an UPDATE, scoping
+// start/end keys to each range's bounds.
+func buildUpdatePrepare(tableId uint32, queryStart, queryEnd uint64, where sqllayer.Expression, updateCol int32, field btree.Field) func(*RangeDescriptor, uint64) *rs.PrepareRequest {
+	return func(desc *RangeDescriptor, txnId uint64) *rs.PrepareRequest {
+		return &rs.PrepareRequest{
+			TxnId:     txnId,
+			Op:        rs.RangeOp_UPDATE,
+			TableId:   tableId,
+			StartKey:  max64(queryStart, desc.StartKey),
+			EndKey:    min64(queryEnd, desc.EndKey-1),
+			Where:     exprToProto(where),
+			Fields:    fieldsToProto([]btree.Field{field}),
+			UpdateCol: updateCol,
 		}
 	}
-	return &ResultSet{}, nil
+}
+
+// buildDeletePrepare returns a buildPrepare closure for a DELETE, scoping
+// start/end keys to each range's bounds.
+func buildDeletePrepare(tableId uint32, queryStart, queryEnd uint64, where sqllayer.Expression) func(*RangeDescriptor, uint64) *rs.PrepareRequest {
+	return func(desc *RangeDescriptor, txnId uint64) *rs.PrepareRequest {
+		return &rs.PrepareRequest{
+			TxnId:    txnId,
+			Op:       rs.RangeOp_DELETE,
+			TableId:  tableId,
+			StartKey: max64(queryStart, desc.StartKey),
+			EndKey:   min64(queryEnd, desc.EndKey-1),
+			Where:    exprToProto(where),
+		}
+	}
 }
 
 func (gw *Gateway) sendToLeader(desc *RangeDescriptor, req *rs.RangeRequest) (*ResultSet, error) {
@@ -391,6 +422,12 @@ func fieldsToProto(fields []btree.Field) []*rs.Field {
 			pf.Value = &rs.FieldValue{Value: &rs.FieldValue_IntVal{IntVal: v.V}}
 		case btree.StringValue:
 			pf.Value = &rs.FieldValue{Value: &rs.FieldValue_StrVal{StrVal: v.V}}
+		default:
+			// NullValue, ListValue, and any future types are serialised with
+			// btree.EncodeField so no information is lost on the round-trip.
+			if b, err := btree.EncodeField(f); err == nil {
+				pf.Value = &rs.FieldValue{Value: &rs.FieldValue_BytesVal{BytesVal: b}}
+			}
 		}
 		out[i] = pf
 	}
@@ -407,6 +444,12 @@ func protoFieldToBTree(f *rs.Field) btree.Field {
 		bf.Value = btree.IntValue{V: v.IntVal}
 	case *rs.FieldValue_StrVal:
 		bf.Value = btree.StringValue{V: v.StrVal}
+	case *rs.FieldValue_BytesVal:
+		// Decode the opaque btree-encoded bytes back to a Field.
+		if fields, _ := btree.DecodeFields(v.BytesVal); len(fields) > 0 {
+			bf.Tag = fields[0].Tag
+			bf.Value = fields[0].Value
+		}
 	}
 	return bf
 }

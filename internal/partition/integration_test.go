@@ -49,21 +49,115 @@ func buildColMeta(schema *sqllayer.TableSchemaValue) *colMeta {
 // simRangeServer: faithful in-process RangeServiceServer
 // ---------------------------------------------------------------------------
 
+// simOp is a single staged mutation inside a pending 2PC transaction.
+type simOp struct {
+	del    bool // true → delete key; false → upsert key with fields
+	key    uint64
+	fields []btree.Field // nil for deletes
+}
+
+// prepareShouldFail lets a test force Prepare to return failure.
 type simRangeServer struct {
 	rs.UnimplementedRangeServiceServer
-	mu      sync.Mutex
-	bt      *btree.BTree
-	schemas map[uint32]*colMeta // tableId → metadata
+	mu          sync.Mutex
+	bt          *btree.BTree
+	schemas     map[uint32]*colMeta // tableId → metadata
+	pending     map[uint64][]simOp  // txnId → staged ops (accumulated across Prepare calls)
+	failPrepare bool                // when true, Prepare returns Success=false
 }
 
 func newSimRangeServer(bt *btree.BTree) *simRangeServer {
-	return &simRangeServer{bt: bt, schemas: make(map[uint32]*colMeta)}
+	return &simRangeServer{
+		bt:      bt,
+		schemas: make(map[uint32]*colMeta),
+		pending: make(map[uint64][]simOp),
+	}
 }
 
 func (s *simRangeServer) registerSchema(tableId uint32, schema *sqllayer.TableSchemaValue) {
 	s.mu.Lock()
 	s.schemas[tableId] = buildColMeta(schema)
 	s.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// 2PC RPC implementations
+// ---------------------------------------------------------------------------
+
+func (s *simRangeServer) Prepare(_ context.Context, req *rs.PrepareRequest) (*rs.PrepareResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.failPrepare {
+		return &rs.PrepareResponse{Success: false, Error: "simulated prepare failure"}, nil
+	}
+
+	var ops []simOp
+	switch req.Op {
+	case rs.RangeOp_INSERT:
+		ops = append(ops, simOp{key: req.Key, fields: simProtoToFields(req.Fields)})
+
+	case rs.RangeOp_UPDATE, rs.RangeOp_DELETE:
+		rows, err := s.bt.RangeScan(req.StartKey, req.EndKey)
+		if err != nil {
+			return &rs.PrepareResponse{Success: false, Error: err.Error()}, nil
+		}
+		meta := s.schemas[req.TableId]
+		for _, row := range rows {
+			if req.Where != nil && !evalProtoExpr(req.Where, row.Fields, meta) {
+				continue
+			}
+			if req.Op == rs.RangeOp_DELETE {
+				ops = append(ops, simOp{del: true, key: row.Key})
+			} else {
+				newFields := make([]btree.Field, len(row.Fields))
+				copy(newFields, row.Fields)
+				if len(req.Fields) > 0 && int(req.UpdateCol) < len(newFields) {
+					updated := protoFieldToBTree(req.Fields[0])
+					updated.Tag = uint8(req.UpdateCol)
+					newFields[req.UpdateCol] = updated
+				}
+				ops = append(ops, simOp{key: row.Key, fields: newFields})
+			}
+		}
+	}
+
+	// Accumulate ops for the same txnId (handles co-located ranges).
+	s.pending[req.TxnId] = append(s.pending[req.TxnId], ops...)
+	return &rs.PrepareResponse{Success: true}, nil
+}
+
+func (s *simRangeServer) Commit(_ context.Context, req *rs.CommitRequest) (*rs.CommitResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ops, ok := s.pending[req.TxnId]
+	if !ok {
+		// Idempotent: already committed (or nothing staged on this node for this txn).
+		// Happens when two co-located ranges share a node — the first Commit consumes
+		// all accumulated ops; the second Commit is a safe no-op.
+		return &rs.CommitResponse{Success: true}, nil
+	}
+	for _, op := range ops {
+		if op.del {
+			_ = s.bt.Delete(op.key)
+		} else {
+			_ = s.bt.Insert(op.key, op.fields)
+		}
+	}
+	delete(s.pending, req.TxnId)
+	return &rs.CommitResponse{Success: true}, nil
+}
+
+func (s *simRangeServer) Abort(_ context.Context, req *rs.AbortRequest) (*rs.AbortResponse, error) {
+	s.mu.Lock()
+	delete(s.pending, req.TxnId)
+	s.mu.Unlock()
+	return &rs.AbortResponse{Success: true}, nil
+}
+
+func (s *simRangeServer) WriteCommitRecord(_ context.Context, _ *rs.WriteCommitRecordRequest) (*rs.WriteCommitRecordResponse, error) {
+	return &rs.WriteCommitRecordResponse{Success: true}, nil
 }
 
 func (s *simRangeServer) Execute(_ context.Context, req *rs.RangeRequest) (*rs.RangeResponse, error) {
@@ -1370,5 +1464,268 @@ func TestSimulation_ConcurrentInserts_AllRowsVisible(t *testing.T) {
 	rs := c.selectRows("users", []string{"id"}, nil)
 	if len(rs.Rows) != N {
 		t.Errorf("concurrent inserts: expected %d rows, got %d", N, len(rs.Rows))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2PC — distributed transactions across multiple ranges
+// ---------------------------------------------------------------------------
+
+func TestSimulation_TwoRanges_2PC_UpdateCommitsNewValue(t *testing.T) {
+	c := newSimCluster(t)
+	c.addTable("users", "id", []string{"name"}, []string{"TEXT"})
+
+	schema := c.sc.FindTableSchema("users")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 1)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("users", []sqllayer.Literal{intLitS(strconv.Itoa(i)), strLitS("old")})
+	}
+
+	_, err := c.gw.Execute(&sqllayer.UpdateStatement{
+		Table: "users", Column: "name",
+		Value: sqllayer.Literal{Value: "new", Type: sqllayer.TOKEN_STRING},
+	})
+	if err != nil {
+		t.Fatalf("2PC UPDATE: %v", err)
+	}
+
+	// Read back via SELECT to confirm the committed value.
+	rs := c.selectRows("users", []string{"id", "name"}, nil)
+	if len(rs.Rows) != 100 {
+		t.Fatalf("expected 100 rows after UPDATE, got %d", len(rs.Rows))
+	}
+	for _, row := range rs.Rows {
+		if len(row.Fields) < 2 {
+			continue
+		}
+		sv, ok := row.Fields[1].Value.(btree.StringValue)
+		if !ok || sv.V != "new" {
+			t.Errorf("row pk=%d: name=%q, want %q", pkVal(row.Key), sv.V, "new")
+		}
+	}
+}
+
+func TestSimulation_TwoRanges_2PC_DeleteRemovesAllRows(t *testing.T) {
+	c := newSimCluster(t)
+	c.addTable("users", "id", []string{"name"}, []string{"TEXT"})
+
+	schema := c.sc.FindTableSchema("users")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 1)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("users", []sqllayer.Literal{intLitS(strconv.Itoa(i)), strLitS("x")})
+	}
+
+	_, err := c.gw.Execute(&sqllayer.DeleteStatement{Table: "users"})
+	if err != nil {
+		t.Fatalf("2PC DELETE: %v", err)
+	}
+
+	rs := c.selectRows("users", []string{"id"}, nil)
+	if len(rs.Rows) != 0 {
+		t.Errorf("after 2PC DELETE: expected 0 rows, got %d", len(rs.Rows))
+	}
+}
+
+func TestSimulation_TwoRanges_2PC_UpdateWithWhere_OnlyMatchingRowsChanged(t *testing.T) {
+	c := newSimCluster(t)
+	c.addTable("users", "id", []string{"name"}, []string{"TEXT"})
+
+	schema := c.sc.FindTableSchema("users")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 1)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("users", []sqllayer.Literal{intLitS(strconv.Itoa(i)), strLitS("old")})
+	}
+
+	// UPDATE WHERE id > 50 → only upper range rows change.
+	_, err := c.gw.Execute(&sqllayer.UpdateStatement{
+		Table: "users", Column: "name",
+		Value: sqllayer.Literal{Value: "new", Type: sqllayer.TOKEN_STRING},
+		Where: &sqllayer.ComparisonExpr{Column: "id", Operator: ">", Value: intLitS("50")},
+	})
+	if err != nil {
+		t.Fatalf("2PC UPDATE with WHERE: %v", err)
+	}
+
+	// Rows 1-50 must still be "old".
+	lower := c.selectRows("users", []string{"id", "name"},
+		rangeWhere("id", "1", "50"))
+	for _, row := range lower.Rows {
+		if len(row.Fields) < 2 {
+			continue
+		}
+		if sv, ok := row.Fields[1].Value.(btree.StringValue); ok && sv.V != "old" {
+			t.Errorf("row pk=%d should be 'old', got %q", pkVal(row.Key), sv.V)
+		}
+	}
+
+	// Rows 51-100 must be "new".
+	upper := c.selectRows("users", []string{"id", "name"},
+		rangeWhere("id", "51", "100"))
+	if len(upper.Rows) != 50 {
+		t.Fatalf("expected 50 rows in [51,100], got %d", len(upper.Rows))
+	}
+	for _, row := range upper.Rows {
+		if len(row.Fields) < 2 {
+			continue
+		}
+		if sv, ok := row.Fields[1].Value.(btree.StringValue); ok && sv.V != "new" {
+			t.Errorf("row pk=%d should be 'new', got %q", pkVal(row.Key), sv.V)
+		}
+	}
+}
+
+func TestSimulation_TwoRanges_2PC_DeleteWithWhere_OnlyMatchingRowsRemoved(t *testing.T) {
+	c := newSimCluster(t)
+	c.addTable("users", "id", []string{"name"}, []string{"TEXT"})
+
+	schema := c.sc.FindTableSchema("users")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 1)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("users", []sqllayer.Literal{intLitS(strconv.Itoa(i)), strLitS("x")})
+	}
+
+	// DELETE WHERE id <= 50 → lower range rows removed, upper range intact.
+	_, err := c.gw.Execute(&sqllayer.DeleteStatement{
+		Table: "users",
+		Where: &sqllayer.ComparisonExpr{Column: "id", Operator: "<=", Value: intLitS("50")},
+	})
+	if err != nil {
+		t.Fatalf("2PC DELETE with WHERE: %v", err)
+	}
+
+	remaining := c.selectRows("users", []string{"id"}, nil)
+	if len(remaining.Rows) != 50 {
+		t.Errorf("expected 50 rows remaining (id 51-100), got %d", len(remaining.Rows))
+	}
+	for _, row := range remaining.Rows {
+		if pkVal(row.Key) <= 50 {
+			t.Errorf("row pk=%d should have been deleted", pkVal(row.Key))
+		}
+	}
+}
+
+func TestSimulation_TwoRanges_2PC_PrepareFailure_DataUnchanged(t *testing.T) {
+	// Two separate nodes: node 1 handles the lower range, node 2 the upper range.
+	// Node 2's Prepare is set to fail; the coordinator aborts node 1.
+	// Data in both nodes must remain at its original value.
+	c := newMultiNodeCluster(t, 2)
+	c.addTable("users", "id", []string{"name"}, []string{"TEXT"})
+
+	schema := c.sc.FindTableSchema("users")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 2)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("users", []sqllayer.Literal{intLitS(strconv.Itoa(i)), strLitS("original")})
+	}
+
+	// Make node 2 reject Prepare.
+	c.nodes[2].mu.Lock()
+	c.nodes[2].failPrepare = true
+	c.nodes[2].mu.Unlock()
+
+	_, err := c.gw.Execute(&sqllayer.UpdateStatement{
+		Table: "users", Column: "name",
+		Value: sqllayer.Literal{Value: "modified", Type: sqllayer.TOKEN_STRING},
+	})
+	if err == nil {
+		t.Fatal("expected error when Prepare fails on one node, got nil")
+	}
+
+	// Restore prepare so SELECT works normally.
+	c.nodes[2].mu.Lock()
+	c.nodes[2].failPrepare = false
+	c.nodes[2].mu.Unlock()
+
+	// All rows must still be "original" — node 1 was aborted.
+	result := c.selectRows("users", []string{"id", "name"}, nil)
+	for _, row := range result.Rows {
+		if len(row.Fields) < 2 {
+			continue
+		}
+		if sv, ok := row.Fields[1].Value.(btree.StringValue); ok && sv.V != "original" {
+			t.Errorf("row pk=%d: name=%q, want 'original' (abort must roll back node 1)", pkVal(row.Key), sv.V)
+		}
+	}
+}
+
+func TestSimulation_TwoNodes_2PC_UpdateCommitsOnBothNodes(t *testing.T) {
+	// Two nodes with distinct BTrees, each owning half the key range.
+	c := newMultiNodeCluster(t, 2)
+	c.addTable("items", "id", []string{"val"}, []string{"INT"})
+
+	schema := c.sc.FindTableSchema("items")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 2)
+
+	// Insert 50 rows per node.
+	for i := 1; i <= 100; i++ {
+		c.insert("items", []sqllayer.Literal{intLitS(strconv.Itoa(i)), intLitS("0")})
+	}
+
+	// UPDATE all rows via 2PC.
+	_, err := c.gw.Execute(&sqllayer.UpdateStatement{
+		Table: "items", Column: "val",
+		Value: sqllayer.Literal{Value: "99", Type: sqllayer.TOKEN_NUMBER},
+	})
+	if err != nil {
+		t.Fatalf("2PC UPDATE across 2 nodes: %v", err)
+	}
+
+	// Verify both nodes' BTrees were updated.
+	for nodeID, node := range c.nodes {
+		node.mu.Lock()
+		rows, _ := node.bt.RangeScan(
+			sqllayer.EncodeKey(schema.TableId, 0),
+			sqllayer.EncodeKey(schema.TableId, ^uint32(0)),
+		)
+		node.mu.Unlock()
+		for _, row := range rows {
+			if len(row.Fields) < 2 {
+				continue
+			}
+			iv, ok := row.Fields[1].Value.(btree.IntValue)
+			if !ok || iv.V != 99 {
+				t.Errorf("node%d row pk=%d: val=%v, want 99", nodeID, pkVal(row.Key), row.Fields[1].Value)
+			}
+		}
+	}
+}
+
+func TestSimulation_TwoNodes_2PC_DeleteCommitsOnBothNodes(t *testing.T) {
+	c := newMultiNodeCluster(t, 2)
+	c.addTable("items", "id", []string{"val"}, []string{"INT"})
+
+	schema := c.sc.FindTableSchema("items")
+	splitKey := sqllayer.EncodeKey(schema.TableId, 50)
+	c.splitAtKey(splitKey, 1, 2)
+
+	for i := 1; i <= 100; i++ {
+		c.insert("items", []sqllayer.Literal{intLitS(strconv.Itoa(i)), intLitS("1")})
+	}
+
+	_, err := c.gw.Execute(&sqllayer.DeleteStatement{Table: "items"})
+	if err != nil {
+		t.Fatalf("2PC DELETE across 2 nodes: %v", err)
+	}
+
+	for nodeID, node := range c.nodes {
+		node.mu.Lock()
+		rows, _ := node.bt.RangeScan(
+			sqllayer.EncodeKey(schema.TableId, 0),
+			sqllayer.EncodeKey(schema.TableId, ^uint32(0)),
+		)
+		node.mu.Unlock()
+		if len(rows) != 0 {
+			t.Errorf("node%d: expected 0 rows after DELETE, got %d", nodeID, len(rows))
+		}
 	}
 }
