@@ -74,12 +74,15 @@ func (RangeOp) EnumDescriptor() ([]byte, []int) {
 }
 
 // Field mirrors btree.Field: a tag plus a typed value.
+// bytes_val carries opaque btree-encoded bytes for types beyond int/string
+// (NullValue, ListValue, etc.) so the proto round-trip is lossless.
 type FieldValue struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Value:
 	//
 	//	*FieldValue_IntVal
 	//	*FieldValue_StrVal
+	//	*FieldValue_BytesVal
 	Value         isFieldValue_Value `protobuf_oneof:"value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -140,6 +143,15 @@ func (x *FieldValue) GetStrVal() string {
 	return ""
 }
 
+func (x *FieldValue) GetBytesVal() []byte {
+	if x != nil {
+		if x, ok := x.Value.(*FieldValue_BytesVal); ok {
+			return x.BytesVal
+		}
+	}
+	return nil
+}
+
 type isFieldValue_Value interface {
 	isFieldValue_Value()
 }
@@ -152,9 +164,15 @@ type FieldValue_StrVal struct {
 	StrVal string `protobuf:"bytes,2,opt,name=str_val,json=strVal,proto3,oneof"`
 }
 
+type FieldValue_BytesVal struct {
+	BytesVal []byte `protobuf:"bytes,3,opt,name=bytes_val,json=bytesVal,proto3,oneof"`
+}
+
 func (*FieldValue_IntVal) isFieldValue_Value() {}
 
 func (*FieldValue_StrVal) isFieldValue_Value() {}
+
+func (*FieldValue_BytesVal) isFieldValue_Value() {}
 
 type Field struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -631,15 +649,480 @@ func (x *RangeResponse) GetError() string {
 	return ""
 }
 
+type PrepareRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	Op            RangeOp                `protobuf:"varint,2,opt,name=op,proto3,enum=rangeservice.RangeOp" json:"op,omitempty"`
+	TableId       uint32                 `protobuf:"varint,3,opt,name=table_id,json=tableId,proto3" json:"table_id,omitempty"`
+	StartKey      uint64                 `protobuf:"varint,4,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
+	EndKey        uint64                 `protobuf:"varint,5,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
+	Key           uint64                 `protobuf:"varint,6,opt,name=key,proto3" json:"key,omitempty"`                              // INSERT: exact key
+	Fields        []*Field               `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty"`                         // INSERT/UPDATE: data
+	Where         *Expression            `protobuf:"bytes,8,opt,name=where,proto3" json:"where,omitempty"`                           // UPDATE/DELETE: filter
+	UpdateCol     int32                  `protobuf:"varint,9,opt,name=update_col,json=updateCol,proto3" json:"update_col,omitempty"` // UPDATE: column index
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PrepareRequest) Reset() {
+	*x = PrepareRequest{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareRequest) ProtoMessage() {}
+
+func (x *PrepareRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareRequest.ProtoReflect.Descriptor instead.
+func (*PrepareRequest) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *PrepareRequest) GetTxnId() uint64 {
+	if x != nil {
+		return x.TxnId
+	}
+	return 0
+}
+
+func (x *PrepareRequest) GetOp() RangeOp {
+	if x != nil {
+		return x.Op
+	}
+	return RangeOp_SCAN
+}
+
+func (x *PrepareRequest) GetTableId() uint32 {
+	if x != nil {
+		return x.TableId
+	}
+	return 0
+}
+
+func (x *PrepareRequest) GetStartKey() uint64 {
+	if x != nil {
+		return x.StartKey
+	}
+	return 0
+}
+
+func (x *PrepareRequest) GetEndKey() uint64 {
+	if x != nil {
+		return x.EndKey
+	}
+	return 0
+}
+
+func (x *PrepareRequest) GetKey() uint64 {
+	if x != nil {
+		return x.Key
+	}
+	return 0
+}
+
+func (x *PrepareRequest) GetFields() []*Field {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
+func (x *PrepareRequest) GetWhere() *Expression {
+	if x != nil {
+		return x.Where
+	}
+	return nil
+}
+
+func (x *PrepareRequest) GetUpdateCol() int32 {
+	if x != nil {
+		return x.UpdateCol
+	}
+	return 0
+}
+
+type PrepareResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PrepareResponse) Reset() {
+	*x = PrepareResponse{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareResponse) ProtoMessage() {}
+
+func (x *PrepareResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareResponse.ProtoReflect.Descriptor instead.
+func (*PrepareResponse) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *PrepareResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *PrepareResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+type CommitRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommitRequest) Reset() {
+	*x = CommitRequest{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitRequest) ProtoMessage() {}
+
+func (x *CommitRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitRequest.ProtoReflect.Descriptor instead.
+func (*CommitRequest) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *CommitRequest) GetTxnId() uint64 {
+	if x != nil {
+		return x.TxnId
+	}
+	return 0
+}
+
+type CommitResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommitResponse) Reset() {
+	*x = CommitResponse{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitResponse) ProtoMessage() {}
+
+func (x *CommitResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitResponse.ProtoReflect.Descriptor instead.
+func (*CommitResponse) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *CommitResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *CommitResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+type AbortRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AbortRequest) Reset() {
+	*x = AbortRequest{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AbortRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AbortRequest) ProtoMessage() {}
+
+func (x *AbortRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AbortRequest.ProtoReflect.Descriptor instead.
+func (*AbortRequest) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *AbortRequest) GetTxnId() uint64 {
+	if x != nil {
+		return x.TxnId
+	}
+	return 0
+}
+
+type AbortResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AbortResponse) Reset() {
+	*x = AbortResponse{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AbortResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AbortResponse) ProtoMessage() {}
+
+func (x *AbortResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AbortResponse.ProtoReflect.Descriptor instead.
+func (*AbortResponse) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *AbortResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *AbortResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+type WriteCommitRecordRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	Status        uint32                 `protobuf:"varint,2,opt,name=status,proto3" json:"status,omitempty"` // DistTxnStatus: 2=Committed, 3=Aborted
+	RangeIds      []uint64               `protobuf:"varint,3,rep,packed,name=range_ids,json=rangeIds,proto3" json:"range_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WriteCommitRecordRequest) Reset() {
+	*x = WriteCommitRecordRequest{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WriteCommitRecordRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WriteCommitRecordRequest) ProtoMessage() {}
+
+func (x *WriteCommitRecordRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WriteCommitRecordRequest.ProtoReflect.Descriptor instead.
+func (*WriteCommitRecordRequest) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *WriteCommitRecordRequest) GetTxnId() uint64 {
+	if x != nil {
+		return x.TxnId
+	}
+	return 0
+}
+
+func (x *WriteCommitRecordRequest) GetStatus() uint32 {
+	if x != nil {
+		return x.Status
+	}
+	return 0
+}
+
+func (x *WriteCommitRecordRequest) GetRangeIds() []uint64 {
+	if x != nil {
+		return x.RangeIds
+	}
+	return nil
+}
+
+type WriteCommitRecordResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WriteCommitRecordResponse) Reset() {
+	*x = WriteCommitRecordResponse{}
+	mi := &file_proto_rangeservice_range_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WriteCommitRecordResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WriteCommitRecordResponse) ProtoMessage() {}
+
+func (x *WriteCommitRecordResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_rangeservice_range_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WriteCommitRecordResponse.ProtoReflect.Descriptor instead.
+func (*WriteCommitRecordResponse) Descriptor() ([]byte, []int) {
+	return file_proto_rangeservice_range_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *WriteCommitRecordResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *WriteCommitRecordResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_proto_rangeservice_range_proto protoreflect.FileDescriptor
 
 const file_proto_rangeservice_range_proto_rawDesc = "" +
 	"\n" +
-	"\x1eproto/rangeservice/range.proto\x12\frangeservice\"K\n" +
+	"\x1eproto/rangeservice/range.proto\x12\frangeservice\"j\n" +
 	"\n" +
 	"FieldValue\x12\x19\n" +
 	"\aint_val\x18\x01 \x01(\x03H\x00R\x06intVal\x12\x19\n" +
-	"\astr_val\x18\x02 \x01(\tH\x00R\x06strValB\a\n" +
+	"\astr_val\x18\x02 \x01(\tH\x00R\x06strVal\x12\x1d\n" +
+	"\tbytes_val\x18\x03 \x01(\fH\x00R\bbytesValB\a\n" +
 	"\x05value\"I\n" +
 	"\x05Field\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\rR\x03tag\x12.\n" +
@@ -676,6 +1159,37 @@ const file_proto_rangeservice_range_proto_rawDesc = "" +
 	"\x06fields\x18\x02 \x03(\v2\x13.rangeservice.FieldR\x06fields\"R\n" +
 	"\rRangeResponse\x12+\n" +
 	"\x04rows\x18\x01 \x03(\v2\x17.rangeservice.ResultRowR\x04rows\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xad\x02\n" +
+	"\x0ePrepareRequest\x12\x15\n" +
+	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x12%\n" +
+	"\x02op\x18\x02 \x01(\x0e2\x15.rangeservice.RangeOpR\x02op\x12\x19\n" +
+	"\btable_id\x18\x03 \x01(\rR\atableId\x12\x1b\n" +
+	"\tstart_key\x18\x04 \x01(\x04R\bstartKey\x12\x17\n" +
+	"\aend_key\x18\x05 \x01(\x04R\x06endKey\x12\x10\n" +
+	"\x03key\x18\x06 \x01(\x04R\x03key\x12+\n" +
+	"\x06fields\x18\a \x03(\v2\x13.rangeservice.FieldR\x06fields\x12.\n" +
+	"\x05where\x18\b \x01(\v2\x18.rangeservice.ExpressionR\x05where\x12\x1d\n" +
+	"\n" +
+	"update_col\x18\t \x01(\x05R\tupdateCol\"A\n" +
+	"\x0fPrepareResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"&\n" +
+	"\rCommitRequest\x12\x15\n" +
+	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\"@\n" +
+	"\x0eCommitResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"%\n" +
+	"\fAbortRequest\x12\x15\n" +
+	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\"?\n" +
+	"\rAbortResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"f\n" +
+	"\x18WriteCommitRecordRequest\x12\x15\n" +
+	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\rR\x06status\x12\x1b\n" +
+	"\trange_ids\x18\x03 \x03(\x04R\brangeIds\"K\n" +
+	"\x19WriteCommitRecordResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error*7\n" +
 	"\aRangeOp\x12\b\n" +
 	"\x04SCAN\x10\x00\x12\n" +
@@ -684,9 +1198,13 @@ const file_proto_rangeservice_range_proto_rawDesc = "" +
 	"\n" +
 	"\x06UPDATE\x10\x02\x12\n" +
 	"\n" +
-	"\x06DELETE\x10\x032R\n" +
+	"\x06DELETE\x10\x032\x87\x03\n" +
 	"\fRangeService\x12B\n" +
-	"\aExecute\x12\x1a.rangeservice.RangeRequest\x1a\x1b.rangeservice.RangeResponseBTZRgithub.com/your-username/DistributedDatabaseSystem/proto/rangeservice;rangeserviceb\x06proto3"
+	"\aExecute\x12\x1a.rangeservice.RangeRequest\x1a\x1b.rangeservice.RangeResponse\x12F\n" +
+	"\aPrepare\x12\x1c.rangeservice.PrepareRequest\x1a\x1d.rangeservice.PrepareResponse\x12C\n" +
+	"\x06Commit\x12\x1b.rangeservice.CommitRequest\x1a\x1c.rangeservice.CommitResponse\x12@\n" +
+	"\x05Abort\x12\x1a.rangeservice.AbortRequest\x1a\x1b.rangeservice.AbortResponse\x12d\n" +
+	"\x11WriteCommitRecord\x12&.rangeservice.WriteCommitRecordRequest\x1a'.rangeservice.WriteCommitRecordResponseBTZRgithub.com/your-username/DistributedDatabaseSystem/proto/rangeservice;rangeserviceb\x06proto3"
 
 var (
 	file_proto_rangeservice_range_proto_rawDescOnce sync.Once
@@ -701,17 +1219,25 @@ func file_proto_rangeservice_range_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_rangeservice_range_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_rangeservice_range_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_proto_rangeservice_range_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_proto_rangeservice_range_proto_goTypes = []any{
-	(RangeOp)(0),           // 0: rangeservice.RangeOp
-	(*FieldValue)(nil),     // 1: rangeservice.FieldValue
-	(*Field)(nil),          // 2: rangeservice.Field
-	(*ComparisonExpr)(nil), // 3: rangeservice.ComparisonExpr
-	(*LogicalExpr)(nil),    // 4: rangeservice.LogicalExpr
-	(*Expression)(nil),     // 5: rangeservice.Expression
-	(*RangeRequest)(nil),   // 6: rangeservice.RangeRequest
-	(*ResultRow)(nil),      // 7: rangeservice.ResultRow
-	(*RangeResponse)(nil),  // 8: rangeservice.RangeResponse
+	(RangeOp)(0),                      // 0: rangeservice.RangeOp
+	(*FieldValue)(nil),                // 1: rangeservice.FieldValue
+	(*Field)(nil),                     // 2: rangeservice.Field
+	(*ComparisonExpr)(nil),            // 3: rangeservice.ComparisonExpr
+	(*LogicalExpr)(nil),               // 4: rangeservice.LogicalExpr
+	(*Expression)(nil),                // 5: rangeservice.Expression
+	(*RangeRequest)(nil),              // 6: rangeservice.RangeRequest
+	(*ResultRow)(nil),                 // 7: rangeservice.ResultRow
+	(*RangeResponse)(nil),             // 8: rangeservice.RangeResponse
+	(*PrepareRequest)(nil),            // 9: rangeservice.PrepareRequest
+	(*PrepareResponse)(nil),           // 10: rangeservice.PrepareResponse
+	(*CommitRequest)(nil),             // 11: rangeservice.CommitRequest
+	(*CommitResponse)(nil),            // 12: rangeservice.CommitResponse
+	(*AbortRequest)(nil),              // 13: rangeservice.AbortRequest
+	(*AbortResponse)(nil),             // 14: rangeservice.AbortResponse
+	(*WriteCommitRecordRequest)(nil),  // 15: rangeservice.WriteCommitRecordRequest
+	(*WriteCommitRecordResponse)(nil), // 16: rangeservice.WriteCommitRecordResponse
 }
 var file_proto_rangeservice_range_proto_depIdxs = []int32{
 	1,  // 0: rangeservice.Field.value:type_name -> rangeservice.FieldValue
@@ -724,13 +1250,24 @@ var file_proto_rangeservice_range_proto_depIdxs = []int32{
 	5,  // 7: rangeservice.RangeRequest.where:type_name -> rangeservice.Expression
 	2,  // 8: rangeservice.ResultRow.fields:type_name -> rangeservice.Field
 	7,  // 9: rangeservice.RangeResponse.rows:type_name -> rangeservice.ResultRow
-	6,  // 10: rangeservice.RangeService.Execute:input_type -> rangeservice.RangeRequest
-	8,  // 11: rangeservice.RangeService.Execute:output_type -> rangeservice.RangeResponse
-	11, // [11:12] is the sub-list for method output_type
-	10, // [10:11] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	0,  // 10: rangeservice.PrepareRequest.op:type_name -> rangeservice.RangeOp
+	2,  // 11: rangeservice.PrepareRequest.fields:type_name -> rangeservice.Field
+	5,  // 12: rangeservice.PrepareRequest.where:type_name -> rangeservice.Expression
+	6,  // 13: rangeservice.RangeService.Execute:input_type -> rangeservice.RangeRequest
+	9,  // 14: rangeservice.RangeService.Prepare:input_type -> rangeservice.PrepareRequest
+	11, // 15: rangeservice.RangeService.Commit:input_type -> rangeservice.CommitRequest
+	13, // 16: rangeservice.RangeService.Abort:input_type -> rangeservice.AbortRequest
+	15, // 17: rangeservice.RangeService.WriteCommitRecord:input_type -> rangeservice.WriteCommitRecordRequest
+	8,  // 18: rangeservice.RangeService.Execute:output_type -> rangeservice.RangeResponse
+	10, // 19: rangeservice.RangeService.Prepare:output_type -> rangeservice.PrepareResponse
+	12, // 20: rangeservice.RangeService.Commit:output_type -> rangeservice.CommitResponse
+	14, // 21: rangeservice.RangeService.Abort:output_type -> rangeservice.AbortResponse
+	16, // 22: rangeservice.RangeService.WriteCommitRecord:output_type -> rangeservice.WriteCommitRecordResponse
+	18, // [18:23] is the sub-list for method output_type
+	13, // [13:18] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_proto_rangeservice_range_proto_init() }
@@ -741,6 +1278,7 @@ func file_proto_rangeservice_range_proto_init() {
 	file_proto_rangeservice_range_proto_msgTypes[0].OneofWrappers = []any{
 		(*FieldValue_IntVal)(nil),
 		(*FieldValue_StrVal)(nil),
+		(*FieldValue_BytesVal)(nil),
 	}
 	file_proto_rangeservice_range_proto_msgTypes[4].OneofWrappers = []any{
 		(*Expression_Comparison)(nil),
@@ -752,7 +1290,7 @@ func file_proto_rangeservice_range_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_rangeservice_range_proto_rawDesc), len(file_proto_rangeservice_range_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

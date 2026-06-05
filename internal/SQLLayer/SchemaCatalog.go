@@ -254,3 +254,15 @@ func (sc *SchemaCatalog) FindTableSchema(tableName string) *TableSchemaValue {
 	defer sc.mu.RUnlock()
 	return sc.cache[tableName]
 }
+
+// FindTableByID searches the cache for the schema with the given table ID.
+func (sc *SchemaCatalog) FindTableByID(id uint32) *TableSchemaValue {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	for _, schema := range sc.cache {
+		if schema.TableId == id {
+			return schema
+		}
+	}
+	return nil
+}

@@ -24,6 +24,7 @@ import (
 	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
 	pb "github.com/your-username/DistributedDatabaseSystem/proto/db"
 	raftpb "github.com/your-username/DistributedDatabaseSystem/proto/raft"
+	rs "github.com/your-username/DistributedDatabaseSystem/proto/rangeservice"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -171,6 +172,10 @@ func parsePeers(s string) (map[uint64]string, error) {
 
 func startSignalHandler(servers ...*grpc.Server) {
 	sigCh := make(chan os.Signal, 1)
+	// SIGHUP is sent when a terminal window is closed.  Ignore it so closing
+	// the terminal of one node does not propagate to other nodes that share the
+	// same session (e.g. when all three servers are started in the same shell).
+	signal.Ignore(syscall.SIGHUP)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	for _, s := range servers {
@@ -226,16 +231,21 @@ func main() {
 	//   - Raft mode: registered as the applyHook on the RaftNode so that every
 	//     node (leader and follower alike) applies entries through the same path
 	//     after consensus is reached.
+	txnRecordStore := partition.NewTxnRecordStore()
+
 	applyFn := func(op raft.ReplOp, key uint64, fields []btree.Field) error {
-		var err error
 		switch op {
+		case raft.ReplTxnRecord:
+			txnRecordStore.Store(partition.DecodeTxnRecord(key, fields))
+			return nil
 		case raft.ReplPut:
-			err = bt.Insert(key, fields)
+			if err := bt.Insert(key, fields); err != nil {
+				return err
+			}
 		case raft.ReplDelete:
-			err = bt.Delete(key)
-		}
-		if err != nil {
-			return err
+			if err := bt.Delete(key); err != nil {
+				return err
+			}
 		}
 		if key>>32 == 0 { // schema entry: tableId=0 in upper 32 bits
 			return sc.LoadSchemas()
@@ -313,6 +323,18 @@ func main() {
 			}
 			return out
 		})
+		rn.SetLeaderChangeHook(func(leaderID uint64) {
+			for _, rd := range coordinator.GetAllRanges() {
+				coordinator.UpdateLeader(rd.RangeID, leaderID)
+			}
+			// Router caches descriptors — refresh it so RouteKey sees the new LeaderID.
+			if err := router.Refresh(); err != nil {
+				log.Printf("router refresh after leader change: %v", err)
+			}
+			if leaderID != 0 {
+				log.Printf("leader is now node %d", leaderID)
+			}
+		})
 	}
 
 	srv := &server{tm: tm, ex: ex, sc: sc, gw: gw}
@@ -331,6 +353,7 @@ func main() {
 	raftServer := grpc.NewServer()
 	if rn != nil {
 		raftpb.RegisterRaftServiceServer(raftServer, &raftServiceServer{rn: rn})
+		rs.RegisterRangeServiceServer(raftServer, partition.NewRangeServer(bt, tm, sc, txnRecordStore))
 		go rn.Run()
 		log.Printf("raft node %d listening on :%s", *nodeID, *raftPort)
 	}
@@ -340,7 +363,9 @@ func main() {
 	go startSignalHandler(grpcServer, raftServer)
 	go func() {
 		if err := raftServer.Serve(raftLis); err != nil {
-			log.Fatalf("raft serve: %v", err)
+			// Non-fatal: gRPC can return ErrServerStopped or a transient
+			// accept error when a peer crashes and resets connections.
+			log.Printf("raft serve stopped: %v", err)
 		}
 	}()
 

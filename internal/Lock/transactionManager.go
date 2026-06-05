@@ -142,3 +142,44 @@ func (tm *TransactionManager) discard(txnId uint64) {
 func (tm *TransactionManager) Rollback(txnId uint64) {
 	tm.discard(txnId)
 }
+
+// ReleaseAll releases all locks held by txnId without touching tm.active.
+// Use this for distributed transactions whose lifecycle is managed externally.
+func (tm *TransactionManager) ReleaseAll(txnId uint64) {
+	tm.lm.UnlockAll(txnId)
+}
+
+// ProposeCommands proposes commands to Raft (or applies them in standalone mode)
+// without touching locks or tm.active. Use for metadata-only commands such as
+// commit records that are not associated with a specific local transaction.
+func (tm *TransactionManager) ProposeCommands(commands []raft.RaftCommand) error {
+	if tm.rn != nil && len(commands) > 0 {
+		return tm.rn.Propose(commands)
+	} else if tm.applyFn != nil {
+		for _, cmd := range commands {
+			if err := tm.applyFn(cmd.Op, cmd.Key, cmd.Fields); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// CommitCommands proposes commands to Raft (or applies them directly in standalone
+// mode) and then releases all locks held by txnId. Use for distributed transactions
+// whose commands are stored externally rather than via Begin/AppendRedo.
+func (tm *TransactionManager) CommitCommands(txnId uint64, commands []raft.RaftCommand) error {
+	if tm.rn != nil && len(commands) > 0 {
+		if err := tm.rn.Propose(commands); err != nil {
+			return err // retain locks so the coordinator can retry
+		}
+	} else if tm.applyFn != nil && len(commands) > 0 {
+		for _, cmd := range commands {
+			if err := tm.applyFn(cmd.Op, cmd.Key, cmd.Fields); err != nil {
+				log.Printf("commit: apply key=%d: %v", cmd.Key, err)
+			}
+		}
+	}
+	tm.lm.UnlockAll(txnId)
+	return nil
+}

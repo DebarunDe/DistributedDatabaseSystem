@@ -10,10 +10,13 @@ enum RangeOp {
 }
 
 // Field mirrors btree.Field: a tag plus a typed value.
+// bytes_val carries opaque btree-encoded bytes for types beyond int/string
+// (NullValue, ListValue, etc.) so the proto round-trip is lossless.
 message FieldValue {
     oneof value {
-        int64  int_val = 1;
-        string str_val = 2;
+        int64  int_val   = 1;
+        string str_val   = 2;
+        bytes  bytes_val = 3;
     }
 }
 
@@ -65,6 +68,56 @@ message RangeResponse {
     string             error = 2;
 }
 
+message PrepareRequest {
+    uint64           txn_id     = 1;
+    RangeOp          op         = 2;
+    uint32           table_id   = 3;
+    uint64           start_key  = 4;
+    uint64           end_key    = 5;
+    uint64           key        = 6;   // INSERT: exact key
+    repeated Field   fields     = 7;   // INSERT/UPDATE: data
+    Expression       where      = 8;   // UPDATE/DELETE: filter
+    int32            update_col = 9;   // UPDATE: column index
+}
+
+message PrepareResponse {
+    bool   success = 1;
+    string error   = 2;
+}
+
+message CommitRequest {
+    uint64 txn_id = 1;
+}
+
+message CommitResponse {
+    bool   success = 1;
+    string error   = 2;
+}
+
+message AbortRequest {
+    uint64 txn_id = 1;
+}
+
+message AbortResponse {
+    bool   success = 1;
+    string error   = 2;
+}
+
+message WriteCommitRecordRequest {
+    uint64          txn_id    = 1;
+    uint32          status    = 2; // DistTxnStatus: 2=Committed, 3=Aborted
+    repeated uint64 range_ids = 3;
+}
+
+message WriteCommitRecordResponse {
+    bool   success = 1;
+    string error   = 2;
+}
+
 service RangeService {
     rpc Execute(RangeRequest) returns (RangeResponse);
+    rpc Prepare(PrepareRequest) returns (PrepareResponse);
+    rpc Commit(CommitRequest) returns (CommitResponse);
+    rpc Abort(AbortRequest) returns (AbortResponse);
+    rpc WriteCommitRecord(WriteCommitRecordRequest) returns (WriteCommitRecordResponse);
 }

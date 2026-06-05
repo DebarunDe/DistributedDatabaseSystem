@@ -19,7 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RangeService_Execute_FullMethodName = "/rangeservice.RangeService/Execute"
+	RangeService_Execute_FullMethodName           = "/rangeservice.RangeService/Execute"
+	RangeService_Prepare_FullMethodName           = "/rangeservice.RangeService/Prepare"
+	RangeService_Commit_FullMethodName            = "/rangeservice.RangeService/Commit"
+	RangeService_Abort_FullMethodName             = "/rangeservice.RangeService/Abort"
+	RangeService_WriteCommitRecord_FullMethodName = "/rangeservice.RangeService/WriteCommitRecord"
 )
 
 // RangeServiceClient is the client API for RangeService service.
@@ -27,6 +31,10 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RangeServiceClient interface {
 	Execute(ctx context.Context, in *RangeRequest, opts ...grpc.CallOption) (*RangeResponse, error)
+	Prepare(ctx context.Context, in *PrepareRequest, opts ...grpc.CallOption) (*PrepareResponse, error)
+	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
+	Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error)
+	WriteCommitRecord(ctx context.Context, in *WriteCommitRecordRequest, opts ...grpc.CallOption) (*WriteCommitRecordResponse, error)
 }
 
 type rangeServiceClient struct {
@@ -47,11 +55,55 @@ func (c *rangeServiceClient) Execute(ctx context.Context, in *RangeRequest, opts
 	return out, nil
 }
 
+func (c *rangeServiceClient) Prepare(ctx context.Context, in *PrepareRequest, opts ...grpc.CallOption) (*PrepareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareResponse)
+	err := c.cc.Invoke(ctx, RangeService_Prepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rangeServiceClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitResponse)
+	err := c.cc.Invoke(ctx, RangeService_Commit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rangeServiceClient) Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortResponse)
+	err := c.cc.Invoke(ctx, RangeService_Abort_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rangeServiceClient) WriteCommitRecord(ctx context.Context, in *WriteCommitRecordRequest, opts ...grpc.CallOption) (*WriteCommitRecordResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WriteCommitRecordResponse)
+	err := c.cc.Invoke(ctx, RangeService_WriteCommitRecord_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RangeServiceServer is the server API for RangeService service.
 // All implementations must embed UnimplementedRangeServiceServer
 // for forward compatibility.
 type RangeServiceServer interface {
 	Execute(context.Context, *RangeRequest) (*RangeResponse, error)
+	Prepare(context.Context, *PrepareRequest) (*PrepareResponse, error)
+	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
+	Abort(context.Context, *AbortRequest) (*AbortResponse, error)
+	WriteCommitRecord(context.Context, *WriteCommitRecordRequest) (*WriteCommitRecordResponse, error)
 	mustEmbedUnimplementedRangeServiceServer()
 }
 
@@ -64,6 +116,18 @@ type UnimplementedRangeServiceServer struct{}
 
 func (UnimplementedRangeServiceServer) Execute(context.Context, *RangeRequest) (*RangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Execute not implemented")
+}
+func (UnimplementedRangeServiceServer) Prepare(context.Context, *PrepareRequest) (*PrepareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Prepare not implemented")
+}
+func (UnimplementedRangeServiceServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Commit not implemented")
+}
+func (UnimplementedRangeServiceServer) Abort(context.Context, *AbortRequest) (*AbortResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Abort not implemented")
+}
+func (UnimplementedRangeServiceServer) WriteCommitRecord(context.Context, *WriteCommitRecordRequest) (*WriteCommitRecordResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WriteCommitRecord not implemented")
 }
 func (UnimplementedRangeServiceServer) mustEmbedUnimplementedRangeServiceServer() {}
 func (UnimplementedRangeServiceServer) testEmbeddedByValue()                      {}
@@ -104,6 +168,78 @@ func _RangeService_Execute_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RangeService_Prepare_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RangeServiceServer).Prepare(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RangeService_Prepare_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RangeServiceServer).Prepare(ctx, req.(*PrepareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RangeService_Commit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RangeServiceServer).Commit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RangeService_Commit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RangeServiceServer).Commit(ctx, req.(*CommitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RangeService_Abort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RangeServiceServer).Abort(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RangeService_Abort_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RangeServiceServer).Abort(ctx, req.(*AbortRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RangeService_WriteCommitRecord_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WriteCommitRecordRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RangeServiceServer).WriteCommitRecord(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RangeService_WriteCommitRecord_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RangeServiceServer).WriteCommitRecord(ctx, req.(*WriteCommitRecordRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RangeService_ServiceDesc is the grpc.ServiceDesc for RangeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -114,6 +250,22 @@ var RangeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Execute",
 			Handler:    _RangeService_Execute_Handler,
+		},
+		{
+			MethodName: "Prepare",
+			Handler:    _RangeService_Prepare_Handler,
+		},
+		{
+			MethodName: "Commit",
+			Handler:    _RangeService_Commit_Handler,
+		},
+		{
+			MethodName: "Abort",
+			Handler:    _RangeService_Abort_Handler,
+		},
+		{
+			MethodName: "WriteCommitRecord",
+			Handler:    _RangeService_WriteCommitRecord_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

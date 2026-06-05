@@ -20,6 +20,7 @@ type ReplOp int
 const (
 	ReplPut ReplOp = iota
 	ReplDelete
+	ReplTxnRecord // commit record written to anchor range for crash recovery
 )
 
 type RaftState int
@@ -104,6 +105,11 @@ type RaftNode struct {
 	rangeLookupFn  func(key uint64) (rangeID, startKey, endKey uint64, found bool)
 	leaderRangesFn func() []RangeInfo
 	rangeStats     map[uint64]*rangeStatsEntry
+
+	// leaderChangeFn is called (outside the mutex) whenever the known leader
+	// changes.  leaderID == 0 means no leader is currently known.
+	leaderChangeFn func(leaderID uint64)
+	knownLeaderID  uint64
 	proposalCh     chan Proposal
 	electionTimer  *time.Timer
 	heartbeatTick  *time.Ticker
@@ -194,11 +200,19 @@ func (rn *RaftNode) SetLeaderRangesFunc(fn func() []RangeInfo) {
 	rn.leaderRangesFn = fn
 }
 
+// SetLeaderChangeHook registers fn to be called whenever the cluster leader
+// changes.  fn receives the new leader's node ID (0 = no leader known).
+// fn is invoked outside the Raft mutex so it is safe to call back into the
+// coordinator or gateway.
+func (rn *RaftNode) SetLeaderChangeHook(fn func(leaderID uint64)) {
+	rn.leaderChangeFn = fn
+}
+
 // updateRangeStats updates approximate per-range key-count and byte stats for
 // one log entry. Must be called before the entry is applied to the BTree so
 // that bt.Search reflects pre-apply state.
 func (rn *RaftNode) updateRangeStats(entry RaftLogEntry) {
-	if rn.rangeLookupFn == nil {
+	if rn.rangeLookupFn == nil || entry.Command.Op == ReplTxnRecord {
 		return
 	}
 	rangeID, _, _, ok := rn.rangeLookupFn(entry.Command.Key)
@@ -391,6 +405,25 @@ func (rn *RaftNode) startElection() {
 	}
 }
 
+// notifyLeaderChange fires leaderChangeFn when leaderID differs from the last
+// known value.  Must be called with rn.mu held; the hook itself is invoked in
+// a separate goroutine so it never deadlocks on the mutex.
+func (rn *RaftNode) notifyLeaderChange(leaderID uint64) {
+	if leaderID == rn.knownLeaderID || rn.leaderChangeFn == nil {
+		return
+	}
+	rn.knownLeaderID = leaderID
+	fn := rn.leaderChangeFn
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("raft: leaderChangeFn panic: %v\n%s", r, debug.Stack())
+			}
+		}()
+		fn(leaderID)
+	}()
+}
+
 func (rn *RaftNode) becomeLeader() {
 	rn.state = RaftStateLeader
 	// Drain any pending election-timer event so the leader never accidentally
@@ -405,6 +438,7 @@ func (rn *RaftNode) becomeLeader() {
 		rn.matchIndex[peer] = 0
 	}
 
+	rn.notifyLeaderChange(rn.id)
 	rn.sendHeartbeats()
 }
 
@@ -618,6 +652,7 @@ func (rn *RaftNode) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.Append
 	}
 	rn.state = RaftStateFollower
 	rn.resetElectionTimer()
+	rn.notifyLeaderChange(req.LeaderId)
 
 	if req.PrevLogIndex > 0 {
 		if req.PrevLogIndex > uint64(len(rn.log)) {

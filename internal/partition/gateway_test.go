@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
@@ -25,6 +26,15 @@ type fakeRangeServer struct {
 	mu       sync.Mutex
 	received []*rs.RangeRequest
 	respFn   func(*rs.RangeRequest) (*rs.RangeResponse, error)
+
+	// 2PC call tracking
+	prepareRecv  []*rs.PrepareRequest
+	commitRecv   []*rs.CommitRequest
+	abortRecv    []*rs.AbortRequest
+	writeRecRecv []*rs.WriteCommitRecordRequest
+
+	// Configurable Prepare handler; nil → always succeed.
+	prepareFn func(*rs.PrepareRequest) (*rs.PrepareResponse, error)
 }
 
 func (s *fakeRangeServer) Execute(_ context.Context, req *rs.RangeRequest) (*rs.RangeResponse, error) {
@@ -38,11 +48,67 @@ func (s *fakeRangeServer) Execute(_ context.Context, req *rs.RangeRequest) (*rs.
 	return &rs.RangeResponse{}, nil
 }
 
+func (s *fakeRangeServer) Prepare(_ context.Context, req *rs.PrepareRequest) (*rs.PrepareResponse, error) {
+	s.mu.Lock()
+	s.prepareRecv = append(s.prepareRecv, req)
+	fn := s.prepareFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(req)
+	}
+	return &rs.PrepareResponse{Success: true}, nil
+}
+
+func (s *fakeRangeServer) Commit(_ context.Context, req *rs.CommitRequest) (*rs.CommitResponse, error) {
+	s.mu.Lock()
+	s.commitRecv = append(s.commitRecv, req)
+	s.mu.Unlock()
+	return &rs.CommitResponse{Success: true}, nil
+}
+
+func (s *fakeRangeServer) Abort(_ context.Context, req *rs.AbortRequest) (*rs.AbortResponse, error) {
+	s.mu.Lock()
+	s.abortRecv = append(s.abortRecv, req)
+	s.mu.Unlock()
+	return &rs.AbortResponse{Success: true}, nil
+}
+
+func (s *fakeRangeServer) WriteCommitRecord(_ context.Context, req *rs.WriteCommitRecordRequest) (*rs.WriteCommitRecordResponse, error) {
+	s.mu.Lock()
+	s.writeRecRecv = append(s.writeRecRecv, req)
+	s.mu.Unlock()
+	return &rs.WriteCommitRecordResponse{Success: true}, nil
+}
+
 func (s *fakeRangeServer) requests() []*rs.RangeRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*rs.RangeRequest, len(s.received))
 	copy(out, s.received)
+	return out
+}
+
+func (s *fakeRangeServer) prepareRequests() []*rs.PrepareRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*rs.PrepareRequest, len(s.prepareRecv))
+	copy(out, s.prepareRecv)
+	return out
+}
+
+func (s *fakeRangeServer) commitRequests() []*rs.CommitRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*rs.CommitRequest, len(s.commitRecv))
+	copy(out, s.commitRecv)
+	return out
+}
+
+func (s *fakeRangeServer) abortRequests() []*rs.AbortRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*rs.AbortRequest, len(s.abortRecv))
+	copy(out, s.abortRecv)
 	return out
 }
 
@@ -865,11 +931,10 @@ func TestExecute_Select_ScatterGather_KeyBoundsScopedToRange(t *testing.T) {
 }
 
 func TestExecute_Select_ScatterGather_RowsMergedAcrossRanges(t *testing.T) {
-	callCount := 0
+	var callCount int32
 	srv := &fakeRangeServer{
 		respFn: func(_ *rs.RangeRequest) (*rs.RangeResponse, error) {
-			callCount++
-			key := uint64(callCount)
+			key := uint64(atomic.AddInt32(&callCount, 1))
 			return &rs.RangeResponse{
 				Rows: []*rs.ResultRow{
 					{Key: key, Fields: []*rs.Field{{Tag: 0, Value: &rs.FieldValue{Value: &rs.FieldValue_IntVal{IntVal: int64(key)}}}}},
@@ -981,8 +1046,9 @@ func TestExecute_Update_MultiRange_SendsToEachRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := len(srv.requests()); got != 2 {
-		t.Errorf("expected 2 UPDATE requests, got %d", got)
+	// Multi-range mutations go through 2PC: one Prepare per range.
+	if got := len(srv.prepareRequests()); got != 2 {
+		t.Errorf("expected 2 Prepare calls (one per range), got %d", got)
 	}
 }
 
@@ -1040,8 +1106,9 @@ func TestExecute_Delete_MultiRange_SendsToEachRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := len(srv.requests()); got != 2 {
-		t.Errorf("expected 2 DELETE requests, got %d", got)
+	// Multi-range mutations go through 2PC: one Prepare per range.
+	if got := len(srv.prepareRequests()); got != 2 {
+		t.Errorf("expected 2 Prepare calls (one per range), got %d", got)
 	}
 }
 
@@ -1109,14 +1176,20 @@ func TestExecute_DropTable_SendsAtLeastTwoDeleteRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// one for the schema row + at least one for the data range
-	if got := len(srv.requests()); got < 2 {
-		t.Errorf("expected ≥2 DELETE requests, got %d", got)
+	// Data deletion goes through 2PC (≥1 Prepare with DELETE op).
+	preps := srv.prepareRequests()
+	if len(preps) < 1 {
+		t.Errorf("expected ≥1 Prepare for data deletion, got %d", len(preps))
 	}
-	for _, req := range srv.requests() {
+	for _, req := range preps {
 		if req.Op != rs.RangeOp_DELETE {
-			t.Errorf("Op=%v, want DELETE", req.Op)
+			t.Errorf("Prepare Op=%v, want DELETE", req.Op)
 		}
+	}
+	// Schema deletion goes through Execute (1 DELETE with TableId=0).
+	execs := srv.requests()
+	if len(execs) < 1 {
+		t.Errorf("expected ≥1 Execute DELETE for schema deletion, got %d", len(execs))
 	}
 }
 
@@ -1145,5 +1218,194 @@ func TestExecute_DropTable_ReturnsEmptyResultSet(t *testing.T) {
 	}
 	if len(result.Rows) != 0 {
 		t.Errorf("rows=%d, want 0", len(result.Rows))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2PC — multi-range UPDATE / DELETE via ExecuteDistributed
+// ---------------------------------------------------------------------------
+
+func TestExecute_Update_MultiRange_2PC_CommitCalledPerRange(t *testing.T) {
+	srv := &fakeRangeServer{}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, err := gw.Execute(&sqllayer.UpdateStatement{Table: "users", Column: "name", Value: strLit("x")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := len(srv.commitRequests()); got != 2 {
+		t.Errorf("expected 2 Commit calls (one per range), got %d", got)
+	}
+}
+
+func TestExecute_Update_MultiRange_2PC_PrepareOpIsUpdate(t *testing.T) {
+	srv := &fakeRangeServer{}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, _ = gw.Execute(&sqllayer.UpdateStatement{Table: "users", Column: "name", Value: strLit("x")})
+
+	for i, req := range srv.prepareRequests() {
+		if req.Op != rs.RangeOp_UPDATE {
+			t.Errorf("prepare[%d]: Op=%v, want UPDATE", i, req.Op)
+		}
+	}
+}
+
+func TestExecute_Delete_MultiRange_2PC_CommitCalledPerRange(t *testing.T) {
+	srv := &fakeRangeServer{}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, err := gw.Execute(&sqllayer.DeleteStatement{Table: "users"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := len(srv.commitRequests()); got != 2 {
+		t.Errorf("expected 2 Commit calls (one per range), got %d", got)
+	}
+}
+
+func TestExecute_Update_MultiRange_2PC_PrepareFailure_ReturnsError(t *testing.T) {
+	var calls int32
+	srv := &fakeRangeServer{
+		prepareFn: func(req *rs.PrepareRequest) (*rs.PrepareResponse, error) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return &rs.PrepareResponse{Success: false, Error: "lock conflict"}, nil
+			}
+			return &rs.PrepareResponse{Success: true}, nil
+		},
+	}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, err := gw.Execute(&sqllayer.UpdateStatement{Table: "users", Column: "name", Value: strLit("x")})
+	if err == nil {
+		t.Fatal("expected error when Prepare fails, got nil")
+	}
+}
+
+func TestExecute_Update_MultiRange_2PC_PrepareFailure_AbortsOtherRange(t *testing.T) {
+	var prepares int32
+	srv := &fakeRangeServer{
+		prepareFn: func(*rs.PrepareRequest) (*rs.PrepareResponse, error) {
+			// First prepare succeeds, second fails.
+			if atomic.AddInt32(&prepares, 1) == 2 {
+				return &rs.PrepareResponse{Success: false, Error: "conflict"}, nil
+			}
+			return &rs.PrepareResponse{Success: true}, nil
+		},
+	}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, _ = gw.Execute(&sqllayer.UpdateStatement{Table: "users", Column: "name", Value: strLit("x")})
+
+	// The range that succeeded its Prepare must receive an Abort.
+	if got := len(srv.abortRequests()); got < 1 {
+		t.Errorf("expected ≥1 Abort for the prepared range, got %d", got)
+	}
+	// No Commit should be sent.
+	if got := len(srv.commitRequests()); got != 0 {
+		t.Errorf("expected 0 Commit calls on failure, got %d", got)
+	}
+}
+
+func TestExecute_Update_MultiRange_2PC_PrepareCarriesCorrectTableAndColumn(t *testing.T) {
+	srv := &fakeRangeServer{}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tableId := sc.FindTableSchema("users").TableId
+	splitKey := sqllayer.EncodeKey(tableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, _ = gw.Execute(&sqllayer.UpdateStatement{
+		Table:  "users",
+		Column: "name",
+		Value:  strLit("updated"),
+		Where: &sqllayer.ComparisonExpr{
+			Column: "id", Operator: "=", Value: intLit("5"),
+		},
+	})
+
+	for i, req := range srv.prepareRequests() {
+		if req.TableId != tableId {
+			t.Errorf("prepare[%d]: TableId=%d, want %d", i, req.TableId, tableId)
+		}
+		if req.UpdateCol != 1 { // "name" is the first non-PK column → index 1
+			t.Errorf("prepare[%d]: UpdateCol=%d, want 1", i, req.UpdateCol)
+		}
+		if req.Where == nil {
+			t.Errorf("prepare[%d]: WHERE not forwarded", i)
+		}
+	}
+}
+
+func TestExecute_Delete_MultiRange_2PC_PrepareCarriesWhere(t *testing.T) {
+	srv := &fakeRangeServer{}
+	sc := sqllayer.NewSchemaCatalog(newTestBTreeGateway(t))
+	if err := sc.CreateTable("users", "id", "INT", []string{"name"}, []string{"TEXT"}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	splitKey := sqllayer.EncodeKey(sc.FindTableSchema("users").TableId, 50)
+
+	gw, _ := newSplitGateway(t, splitKey, srv)
+	_, _ = gw.Execute(&sqllayer.DeleteStatement{
+		Table: "users",
+		Where: &sqllayer.ComparisonExpr{Column: "id", Operator: ">", Value: intLit("10")},
+	})
+
+	for i, req := range srv.prepareRequests() {
+		if req.Where == nil {
+			t.Errorf("prepare[%d]: WHERE not forwarded in 2PC Delete", i)
+		}
+	}
+}
+
+func TestExecute_DropTable_2PC_DataDeleteVia2PC_SchemaDeleteViaExecute(t *testing.T) {
+	srv := &fakeRangeServer{}
+	gw, _ := newTestGateway(t, srv)
+	_, err := gw.Execute(&sqllayer.DropTableStatement{Table: "users"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Data deletion uses 2PC Prepare with DELETE op.
+	preps := srv.prepareRequests()
+	if len(preps) == 0 {
+		t.Fatal("expected at least one 2PC Prepare for data deletion")
+	}
+	if preps[0].Op != rs.RangeOp_DELETE {
+		t.Errorf("Prepare Op=%v, want DELETE", preps[0].Op)
+	}
+	// Schema deletion uses a direct Execute with TableId=0.
+	execs := srv.requests()
+	if len(execs) == 0 {
+		t.Fatal("expected at least one Execute for schema deletion")
+	}
+	if execs[0].TableId != 0 {
+		t.Errorf("schema Execute TableId=%d, want 0", execs[0].TableId)
 	}
 }
