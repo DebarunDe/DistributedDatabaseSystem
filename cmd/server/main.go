@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	ap "github.com/your-username/DistributedDatabaseSystem/internal/AP"
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
@@ -233,6 +234,13 @@ func main() {
 	//     after consensus is reached.
 	txnRecordStore := partition.NewTxnRecordStore()
 
+	timestamps := ap.NewTimestampStore()
+	apLog, err := ap.NewAPWriteLog(*dbPath + "_ap.log")
+	if err != nil {
+		log.Fatalf("open ap log: %v", err)
+	}
+	defer func() { _ = apLog.Close() }()
+
 	applyFn := func(op raft.ReplOp, key uint64, fields []btree.Field) error {
 		switch op {
 		case raft.ReplTxnRecord:
@@ -353,9 +361,15 @@ func main() {
 	raftServer := grpc.NewServer()
 	if rn != nil {
 		raftpb.RegisterRaftServiceServer(raftServer, &raftServiceServer{rn: rn})
-		rs.RegisterRangeServiceServer(raftServer, partition.NewRangeServer(bt, tm, sc, txnRecordStore))
+		rs.RegisterRangeServiceServer(raftServer, partition.NewRangeServer(bt, tm, sc, txnRecordStore, timestamps, apLog))
 		go rn.Run()
 		log.Printf("raft node %d listening on :%s", *nodeID, *raftPort)
+
+		// Start the AP syncer so eventual-consistency tables replicate across peers.
+		syncerCtx, syncerCancel := context.WithCancel(context.Background())
+		_ = syncerCancel // cancelled via signal handler below
+		apSyncer := ap.NewAPSyncer(bt, timestamps, apLog, nil /* peers wired up separately */, sc)
+		go apSyncer.Run(syncerCtx)
 	}
 
 	log.Printf("SQL server listening on :%s", *port)

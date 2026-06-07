@@ -8,9 +8,10 @@ import (
 )
 
 type TableSchemaValue struct {
-	TableId    uint32
-	PrimaryKey ColumnDef
-	Columns    []ColumnDef // excludes primary key, ordered by index
+	TableId     uint32
+	PrimaryKey  ColumnDef
+	Columns     []ColumnDef     // excludes primary key, ordered by index
+	Consistency ConsistencyMode // default CP
 }
 
 type SchemaCatalog struct {
@@ -47,7 +48,7 @@ func (sc *SchemaCatalog) LoadSchemas() error {
 
 	for _, r := range results {
 		if len(r.Fields) < 5 {
-			return fmt.Errorf("schema row for key %d has %d fields, expected 5", r.Key, len(r.Fields))
+			return fmt.Errorf("schema row for key %d has %d fields, expected at least 5", r.Key, len(r.Fields))
 		}
 
 		//tableId is lower 32 bits of key
@@ -111,11 +112,20 @@ func (sc *SchemaCatalog) LoadSchemas() error {
 			})
 		}
 
+		// Field[5] — consistency mode (optional, default CP for backward compat)
+		consistency := ConsistencyCP
+		if len(r.Fields) >= 6 {
+			if iv, ok := r.Fields[5].Value.(btree.IntValue); ok {
+				consistency = ConsistencyMode(iv.V)
+			}
+		}
+
 		//Populate cache
 		sc.cache[tableName] = &TableSchemaValue{
-			TableId:    tableId,
-			PrimaryKey: primaryKey,
-			Columns:    columns,
+			TableId:     tableId,
+			PrimaryKey:  primaryKey,
+			Columns:     columns,
+			Consistency: consistency,
 		}
 	}
 
@@ -131,7 +141,7 @@ func (sc *SchemaCatalog) NextTableId() uint32 {
 
 // buildSchemaFields encodes a table schema as the BTree fields stored under
 // EncodeKey(0, tableId). Shared by BuildCreateTableCommand and CreateTable.
-func buildSchemaFields(tableName, pkName, pkType string, colNames, colTypes []string) []btree.Field {
+func buildSchemaFields(tableName, pkName, pkType string, colNames, colTypes []string, consistency ConsistencyMode) []btree.Field {
 	fields := []btree.Field{
 		{Tag: 1, Value: btree.StringValue{V: tableName}},
 		{Tag: 2, Value: btree.StringValue{V: pkName}},
@@ -146,6 +156,7 @@ func buildSchemaFields(tableName, pkName, pkType string, colNames, colTypes []st
 	fields = append(fields,
 		btree.Field{Tag: 4, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: nameElems}},
 		btree.Field{Tag: 5, Value: btree.ListValue{ElemType: btree.FieldTypeString, Elems: typeElems}},
+		btree.Field{Tag: 6, Value: btree.IntValue{V: int64(consistency)}},
 	)
 	return fields
 }
@@ -167,7 +178,27 @@ func (sc *SchemaCatalog) BuildCreateTableCommand(tableName, pkName, pkType strin
 	newTableId := sc.maxTableId + 1
 	sc.maxTableId = newTableId // reserve so concurrent creates get distinct IDs
 	key := EncodeKey(0, newTableId)
-	return key, buildSchemaFields(tableName, pkName, pkType, colNames, colTypes), nil
+	return key, buildSchemaFields(tableName, pkName, pkType, colNames, colTypes, ConsistencyCP), nil
+}
+
+// BuildAlterConsistencyCommand returns the BTree key and fields for updating a table's
+// consistency mode. The write is routed through Raft; applyHook calls LoadSchemas after commit.
+func (sc *SchemaCatalog) BuildAlterConsistencyCommand(tableName string, mode ConsistencyMode) (uint64, []btree.Field, error) {
+	sc.mu.RLock()
+	schema, ok := sc.cache[tableName]
+	sc.mu.RUnlock()
+	if !ok {
+		return 0, nil, fmt.Errorf("table %q not found", tableName)
+	}
+	colNames := make([]string, len(schema.Columns))
+	colTypes := make([]string, len(schema.Columns))
+	for i, c := range schema.Columns {
+		colNames[i] = c.Name
+		colTypes[i] = c.DataType
+	}
+	key := EncodeKey(0, schema.TableId)
+	fields := buildSchemaFields(tableName, schema.PrimaryKey.Name, schema.PrimaryKey.DataType, colNames, colTypes, mode)
+	return key, fields, nil
 }
 
 // CreateTable validates that table name to be added does not exist, assigns new table id, encodes as catalog row, and adds to cache
@@ -183,7 +214,7 @@ func (sc *SchemaCatalog) CreateTable(tableName string, primaryKeyName string, pr
 
 	newTableId := sc.maxTableId + 1
 	key := EncodeKey(0, newTableId)
-	fields := buildSchemaFields(tableName, primaryKeyName, primaryKeyType, columnNames, columnTypes)
+	fields := buildSchemaFields(tableName, primaryKeyName, primaryKeyType, columnNames, columnTypes, ConsistencyCP)
 
 	if err := sc.bt.Insert(key, fields); err != nil {
 		return fmt.Errorf("error inserting table into BTree: %w", err)

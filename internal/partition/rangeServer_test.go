@@ -45,7 +45,7 @@ func newTestRangeServer(t *testing.T) (
 	}
 
 	tm = lock.NewTransactionManager(bt, nil, applyFn)
-	srv = NewRangeServer(bt, tm, sc, records)
+	srv = NewRangeServer(bt, tm, sc, records, nil, nil)
 	return
 }
 
