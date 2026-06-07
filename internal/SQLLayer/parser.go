@@ -162,6 +162,11 @@ func (p *parser) parseSelect() (*SelectStatement, error) {
 		}
 		stmt.Where = expr
 	}
+	override, err := p.parseSelectConsistencyOverride()
+	if err != nil {
+		return nil, fmt.Errorf("SELECT: %w", err)
+	}
+	stmt.ConsistencyOverride = override
 	return stmt, nil
 }
 
@@ -302,4 +307,63 @@ func (p *parser) parseDrop() (*DropTableStatement, error) {
 		return nil, fmt.Errorf("DROP TABLE: %w", err)
 	}
 	return &DropTableStatement{Table: table.Value}, nil
+}
+
+// ALTER TABLE name SET CONSISTENCY STRONG|EVENTUAL
+func (p *parser) parseAlterConsistency() (*AlterConsistencyStatement, error) {
+	p.consume() // ALTER
+	if _, err := p.expect(TOKEN_KEYWORD, "TABLE"); err != nil {
+		return nil, fmt.Errorf("ALTER: %w", err)
+	}
+	table, err := p.expectType(TOKEN_IDENTIFIER)
+	if err != nil {
+		return nil, fmt.Errorf("ALTER TABLE: %w", err)
+	}
+	if _, err := p.expect(TOKEN_KEYWORD, "SET"); err != nil {
+		return nil, fmt.Errorf("ALTER TABLE: %w", err)
+	}
+	if _, err := p.expect(TOKEN_KEYWORD, "CONSISTENCY"); err != nil {
+		return nil, fmt.Errorf("ALTER TABLE SET: %w", err)
+	}
+	modeTok, ok := p.consume()
+	if !ok {
+		return nil, fmt.Errorf("ALTER TABLE SET CONSISTENCY: expected STRONG or EVENTUAL")
+	}
+	var mode ConsistencyMode
+	switch modeTok.Value {
+	case "STRONG":
+		mode = ConsistencyCP
+	case "EVENTUAL":
+		mode = ConsistencyAP
+	default:
+		return nil, fmt.Errorf("ALTER TABLE SET CONSISTENCY: expected STRONG or EVENTUAL, got %q", modeTok.Value)
+	}
+	return &AlterConsistencyStatement{Table: table.Value, Mode: mode}, nil
+}
+
+// parseSelectConsistencyOverride attempts to parse an optional
+// WITH CONSISTENCY STRONG|EVENTUAL suffix. Returns nil if not present.
+func (p *parser) parseSelectConsistencyOverride() (*ConsistencyMode, error) {
+	next, ok := p.peek()
+	if !ok || next.Type != TOKEN_KEYWORD || next.Value != "WITH" {
+		return nil, nil
+	}
+	p.consume() // WITH
+	if _, err := p.expect(TOKEN_KEYWORD, "CONSISTENCY"); err != nil {
+		return nil, fmt.Errorf("WITH: %w", err)
+	}
+	modeTok, ok := p.consume()
+	if !ok {
+		return nil, fmt.Errorf("WITH CONSISTENCY: expected STRONG or EVENTUAL")
+	}
+	var mode ConsistencyMode
+	switch modeTok.Value {
+	case "STRONG":
+		mode = ConsistencyCP
+	case "EVENTUAL":
+		mode = ConsistencyAP
+	default:
+		return nil, fmt.Errorf("WITH CONSISTENCY: expected STRONG or EVENTUAL, got %q", modeTok.Value)
+	}
+	return &mode, nil
 }

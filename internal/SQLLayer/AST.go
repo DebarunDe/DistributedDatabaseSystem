@@ -37,11 +37,12 @@ type ColumnDef struct {
 	DataType string
 }
 
-// SELECT columns FROM table WHERE expr
+// SELECT columns FROM table [WHERE expr] [WITH CONSISTENCY STRONG|EVENTUAL]
 type SelectStatement struct {
-	Columns []string
-	Table   string
-	Where   Expression // nil if no WHERE clause
+	Columns             []string
+	Table               string
+	Where               Expression       // nil if no WHERE clause
+	ConsistencyOverride *ConsistencyMode // nil = use table default
 }
 
 func (s *SelectStatement) isStatement() {}
@@ -87,6 +88,14 @@ type DropTableStatement struct {
 
 func (s *DropTableStatement) isStatement() {}
 
+// ALTER TABLE name SET CONSISTENCY STRONG|EVENTUAL
+type AlterConsistencyStatement struct {
+	Table string
+	Mode  ConsistencyMode
+}
+
+func (s *AlterConsistencyStatement) isStatement() {}
+
 // Statement interface for parser
 type Statement interface {
 	isStatement()
@@ -115,6 +124,8 @@ func Parse(tokens []Token) (Statement, error) {
 		return p.parseCreate()
 	case "DROP":
 		return p.parseDrop()
+	case "ALTER":
+		return p.parseAlterConsistency()
 	default:
 		return nil, fmt.Errorf("unknown statement keyword %q", first.Value)
 	}

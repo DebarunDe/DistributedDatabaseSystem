@@ -88,7 +88,7 @@ func newRealNodeWithSchema(t *testing.T, sc *sqllayer.SchemaCatalog) *realNode {
 	}
 
 	tm := lock.NewTransactionManager(bt, nil, applyFn)
-	srv := NewRangeServer(bt, tm, sc, records)
+	srv := NewRangeServer(bt, tm, sc, records, nil, nil)
 	return &realNode{bt: bt, sc: sc, records: records, srv: srv}
 }
 

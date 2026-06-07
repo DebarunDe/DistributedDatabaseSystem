@@ -34,18 +34,23 @@ func CreateToken(tokenType TokenType, value string) Token {
 
 // map of SQL keywords for quick lookup
 var keywords = map[string]bool{
-	"SELECT": true,
-	"FROM":   true,
-	"WHERE":  true,
-	"INSERT": true,
-	"INTO":   true,
-	"VALUES": true,
-	"UPDATE": true,
-	"SET":    true,
-	"DELETE": true,
-	"CREATE": true,
-	"TABLE":  true,
-	"DROP":   true,
+	"SELECT":      true,
+	"FROM":        true,
+	"WHERE":       true,
+	"INSERT":      true,
+	"INTO":        true,
+	"VALUES":      true,
+	"UPDATE":      true,
+	"SET":         true,
+	"DELETE":      true,
+	"CREATE":      true,
+	"TABLE":       true,
+	"DROP":        true,
+	"ALTER":       true,
+	"CONSISTENCY": true,
+	"STRONG":      true,
+	"EVENTUAL":    true,
+	"WITH":        true,
 }
 
 func isKeyword(word string) bool {

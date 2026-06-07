@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	ap "github.com/your-username/DistributedDatabaseSystem/internal/AP"
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
@@ -17,29 +19,42 @@ import (
 type RangeServer struct {
 	rs.UnimplementedRangeServiceServer
 
-	bt      *btree.BTree
-	tm      *lock.TransactionManager
-	sc      *sqllayer.SchemaCatalog
-	records *TxnRecordStore
+	bt         *btree.BTree
+	tm         *lock.TransactionManager
+	sc         *sqllayer.SchemaCatalog
+	records    *TxnRecordStore
+	timestamps *ap.TimestampStore // nil → AP mode unavailable (CP-only node)
+	apLog      *ap.APWriteLog     // nil → AP mode unavailable
 
 	mu      sync.Mutex
 	pending map[uint64]*PendingTxn
 }
 
-func NewRangeServer(bt *btree.BTree, tm *lock.TransactionManager, sc *sqllayer.SchemaCatalog, records *TxnRecordStore) *RangeServer {
+func NewRangeServer(bt *btree.BTree, tm *lock.TransactionManager, sc *sqllayer.SchemaCatalog, records *TxnRecordStore, timestamps *ap.TimestampStore, apLog *ap.APWriteLog) *RangeServer {
 	return &RangeServer{
-		bt:      bt,
-		tm:      tm,
-		sc:      sc,
-		records: records,
-		pending: make(map[uint64]*PendingTxn),
+		bt:         bt,
+		tm:         tm,
+		sc:         sc,
+		records:    records,
+		timestamps: timestamps,
+		apLog:      apLog,
+		pending:    make(map[uint64]*PendingTxn),
 	}
 }
 
 // Execute handles single-range read/write operations forwarded by the Gateway.
-// SCAN reads directly from the BTree. INSERT/UPDATE/DELETE run through the
-// TransactionManager so every write is replicated via Raft before being applied.
+// For AP tables it bypasses Raft and writes directly to the local BTree + APWriteLog.
+// For CP tables it uses the existing Raft/TransactionManager path.
 func (s *RangeServer) Execute(_ context.Context, req *rs.RangeRequest) (*rs.RangeResponse, error) {
+	schema := s.sc.FindTableByID(req.TableId)
+	if schema != nil && schema.Consistency == sqllayer.ConsistencyAP && s.timestamps != nil && s.apLog != nil {
+		return s.executeAP(req, schema)
+	}
+	return s.executeCP(req)
+}
+
+// executeCP is the original Raft-backed execution path.
+func (s *RangeServer) executeCP(req *rs.RangeRequest) (*rs.RangeResponse, error) {
 	switch req.Op {
 	case rs.RangeOp_SCAN:
 		return s.execRangeScan(req)
@@ -50,6 +65,102 @@ func (s *RangeServer) Execute(_ context.Context, req *rs.RangeRequest) (*rs.Rang
 	default:
 		return &rs.RangeResponse{Error: fmt.Sprintf("unsupported op: %v", req.Op)}, nil
 	}
+}
+
+// executeAP handles operations for AP-mode tables: writes are local+logged,
+// reads are served directly from the local BTree.
+func (s *RangeServer) executeAP(req *rs.RangeRequest, schema *sqllayer.TableSchemaValue) (*rs.RangeResponse, error) {
+	switch req.Op {
+	case rs.RangeOp_SCAN:
+		return s.execAPScan(req)
+	case rs.RangeOp_INSERT:
+		return s.execAPInsert(req)
+	case rs.RangeOp_UPDATE, rs.RangeOp_DELETE:
+		return s.execAPMutation(req, schema)
+	default:
+		return &rs.RangeResponse{Error: fmt.Sprintf("unsupported op: %v", req.Op)}, nil
+	}
+}
+
+func (s *RangeServer) execAPScan(req *rs.RangeRequest) (*rs.RangeResponse, error) {
+	rows, err := s.bt.RangeScan(req.StartKey, req.EndKey)
+	if err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	matched, err := s.filterRows(req.TableId, rows, req.Where)
+	if err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	resp := &rs.RangeResponse{}
+	for _, row := range matched {
+		rr := &rs.ResultRow{Key: row.Key}
+		if len(req.Columns) == 0 {
+			rr.Fields = fieldsToProto(row.Fields)
+		} else {
+			for _, ci := range req.Columns {
+				if int(ci) < len(row.Fields) {
+					rr.Fields = append(rr.Fields, fieldsToProto([]btree.Field{row.Fields[ci]})[0])
+				}
+			}
+		}
+		resp.Rows = append(resp.Rows, rr)
+	}
+	return resp, nil
+}
+
+func (s *RangeServer) execAPInsert(req *rs.RangeRequest) (*rs.RangeResponse, error) {
+	ts := time.Now().UnixNano()
+	fields := make([]btree.Field, len(req.Fields))
+	for i, f := range req.Fields {
+		fields[i] = protoFieldToBTree(f)
+	}
+	if err := s.bt.Insert(req.Key, fields); err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	s.timestamps.Set(req.Key, ts)
+	if _, err := s.apLog.Append(raft.ReplPut, req.Key, ts, fields); err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	return &rs.RangeResponse{}, nil
+}
+
+func (s *RangeServer) execAPMutation(req *rs.RangeRequest, schema *sqllayer.TableSchemaValue) (*rs.RangeResponse, error) {
+	rows, err := s.bt.RangeScan(req.StartKey, req.EndKey)
+	if err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	matched, err := s.filterRows(req.TableId, rows, req.Where)
+	if err != nil {
+		return &rs.RangeResponse{Error: err.Error()}, nil
+	}
+	ts := time.Now().UnixNano()
+	for _, row := range matched {
+		if req.Op == rs.RangeOp_DELETE {
+			if err := s.bt.Delete(row.Key); err != nil {
+				return &rs.RangeResponse{Error: err.Error()}, nil
+			}
+			s.timestamps.Set(row.Key, ts)
+			if _, err := s.apLog.Append(raft.ReplDelete, row.Key, ts, nil); err != nil {
+				return &rs.RangeResponse{Error: err.Error()}, nil
+			}
+		} else { // UPDATE
+			newFields := make([]btree.Field, len(row.Fields))
+			copy(newFields, row.Fields)
+			if len(req.Fields) > 0 && int(req.UpdateCol) < len(newFields) {
+				updated := protoFieldToBTree(req.Fields[0])
+				updated.Tag = uint8(req.UpdateCol)
+				newFields[req.UpdateCol] = updated
+			}
+			if err := s.bt.Insert(row.Key, newFields); err != nil {
+				return &rs.RangeResponse{Error: err.Error()}, nil
+			}
+			s.timestamps.Set(row.Key, ts)
+			if _, err := s.apLog.Append(raft.ReplPut, row.Key, ts, newFields); err != nil {
+				return &rs.RangeResponse{Error: err.Error()}, nil
+			}
+		}
+	}
+	return &rs.RangeResponse{}, nil
 }
 
 func (s *RangeServer) execRangeScan(req *rs.RangeRequest) (*rs.RangeResponse, error) {

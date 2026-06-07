@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	ap "github.com/your-username/DistributedDatabaseSystem/internal/AP"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	rs "github.com/your-username/DistributedDatabaseSystem/proto/rangeservice"
@@ -20,6 +21,7 @@ type Gateway struct {
 	schema *sqllayer.SchemaCatalog
 	conns  map[uint64]*grpc.ClientConn
 	dtm    *DistributedTxnManager
+	picker *ap.ReplicaPicker // round-robin picker for AP reads/writes
 }
 
 // AddConn registers a gRPC connection to nodeID's RangeService port.
@@ -32,6 +34,7 @@ func NewGateway(router *Router, schema *sqllayer.SchemaCatalog) *Gateway {
 		router: router,
 		schema: schema,
 		conns:  make(map[uint64]*grpc.ClientConn),
+		picker: &ap.ReplicaPicker{},
 	}
 	gw.dtm = NewDistributedTxnManager(gw)
 	return gw
@@ -39,20 +42,20 @@ func NewGateway(router *Router, schema *sqllayer.SchemaCatalog) *Gateway {
 
 func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 	switch s := stmt.(type) {
+	case *sqllayer.AlterConsistencyStatement:
+		return gw.executeAlterConsistency(s)
+
 	case *sqllayer.InsertStatement:
 		schema := gw.schema.FindTableSchema(s.Table)
 		if schema == nil {
 			return nil, fmt.Errorf("table %q not found", s.Table)
 		}
+
 		pkVal, err := sqllayer.LiteralToPrimaryKey(s.Values[0])
 		if err != nil {
 			return nil, fmt.Errorf("invalid primary key: %w", err)
 		}
 		key := sqllayer.EncodeKey(schema.TableId, pkVal)
-		desc, err := gw.router.RouteKey(key)
-		if err != nil {
-			return nil, fmt.Errorf("route insert: %w", err)
-		}
 		fields := make([]btree.Field, len(s.Values))
 		for i, lit := range s.Values {
 			colType := schema.PrimaryKey.DataType
@@ -63,17 +66,35 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 				return nil, fmt.Errorf("field %d: %w", i, err)
 			}
 		}
-		return gw.sendToLeader(desc, &rs.RangeRequest{
+		req := &rs.RangeRequest{
 			Op:      rs.RangeOp_INSERT,
 			TableId: schema.TableId,
 			Key:     key,
 			Fields:  fieldsToProto(fields),
-		})
+		}
+		if schema.Consistency == sqllayer.ConsistencyAP {
+			desc, err := gw.router.RouteKey(key)
+			if err != nil {
+				return nil, fmt.Errorf("route ap insert: %w", err)
+			}
+			return gw.sendToAnyReplica(desc, req)
+		}
+		desc, err := gw.router.RouteKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("route insert: %w", err)
+		}
+		return gw.sendToLeader(desc, req)
 
 	case *sqllayer.SelectStatement:
 		schema := gw.schema.FindTableSchema(s.Table)
 		if schema == nil {
 			return nil, fmt.Errorf("table %q not found", s.Table)
+		}
+
+		// Determine effective consistency mode (per-query override takes precedence).
+		mode := schema.Consistency
+		if s.ConsistencyOverride != nil {
+			mode = *s.ConsistencyOverride
 		}
 
 		// Expand SELECT * to the full ordered column list.
@@ -88,8 +109,8 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 
 		low, high := extractPKBounds(s.Where, schema.PrimaryKey.Name)
 		startKey := sqllayer.EncodeKey(schema.TableId, low)
-		endKey := sqllayer.EncodeKey(schema.TableId, high) // inclusive for scans
-		routeEnd := endKey + 1                             // exclusive for RouteRange
+		endKey := sqllayer.EncodeKey(schema.TableId, high)
+		routeEnd := endKey + 1
 		ranges, err := gw.router.RouteRange(startKey, routeEnd)
 		if err != nil {
 			return nil, fmt.Errorf("route select: %w", err)
@@ -103,23 +124,26 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 			cols[i] = int32(idx)
 		}
 
+		scanReq := &rs.RangeRequest{
+			Op:       rs.RangeOp_SCAN,
+			TableId:  schema.TableId,
+			StartKey: startKey,
+			EndKey:   endKey,
+			Where:    exprToProto(s.Where),
+			Columns:  cols,
+		}
+
 		var result *ResultSet
-		if len(ranges) == 1 {
-			result, err = gw.sendToLeader(ranges[0], &rs.RangeRequest{
-				Op:       rs.RangeOp_SCAN,
-				TableId:  schema.TableId,
-				StartKey: startKey,
-				EndKey:   endKey,
-				Where:    exprToProto(s.Where),
-				Columns:  cols,
-			})
+		if mode == sqllayer.ConsistencyAP {
+			result, err = gw.scatterGatherAP(ranges, startKey, endKey, schema.TableId, cols, s.Where)
+		} else if len(ranges) == 1 {
+			result, err = gw.sendToLeader(ranges[0], scanReq)
 		} else {
 			result, err = gw.scatterGather(ranges, startKey, endKey, schema.TableId, cols, s.Where)
 		}
 		if err != nil {
 			return nil, err
 		}
-		// Attach column metadata so the client can render headers.
 		result.Columns = colNames
 		result.ColTypes = make([]string, len(colNames))
 		for i, name := range colNames {
@@ -157,6 +181,24 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 			Fields:    fieldsToProto([]btree.Field{field}),
 			UpdateCol: updateCol,
 		}
+		// AP mode: scatter writes directly to any replica, no 2PC.
+		if schema.Consistency == sqllayer.ConsistencyAP {
+			for _, desc := range ranges {
+				scopedReq := &rs.RangeRequest{
+					Op:        req.Op,
+					TableId:   req.TableId,
+					StartKey:  max64(startKey, desc.StartKey),
+					EndKey:    min64(endKey, desc.EndKey-1),
+					Where:     req.Where,
+					Fields:    req.Fields,
+					UpdateCol: req.UpdateCol,
+				}
+				if _, err := gw.sendToAnyReplica(desc, scopedReq); err != nil {
+					return nil, err
+				}
+			}
+			return &ResultSet{}, nil
+		}
 		if len(ranges) == 1 {
 			return gw.sendToLeader(ranges[0], req)
 		}
@@ -185,6 +227,22 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 			StartKey: startKey,
 			EndKey:   endKey,
 			Where:    exprToProto(s.Where),
+		}
+		// AP mode: scatter deletes directly to any replica, no 2PC.
+		if schema.Consistency == sqllayer.ConsistencyAP {
+			for _, desc := range ranges {
+				scopedReq := &rs.RangeRequest{
+					Op:       req.Op,
+					TableId:  req.TableId,
+					StartKey: max64(startKey, desc.StartKey),
+					EndKey:   min64(endKey, desc.EndKey-1),
+					Where:    req.Where,
+				}
+				if _, err := gw.sendToAnyReplica(desc, scopedReq); err != nil {
+					return nil, err
+				}
+			}
+			return &ResultSet{}, nil
 		}
 		if len(ranges) == 1 {
 			return gw.sendToLeader(ranges[0], req)
@@ -255,6 +313,101 @@ func (gw *Gateway) Execute(stmt sqllayer.Statement) (*ResultSet, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement type %T", stmt)
 	}
+}
+
+// executeAlterConsistency routes an ALTER TABLE … SET CONSISTENCY command through
+// Raft (CP path) so the schema change is durably committed on all nodes.
+func (gw *Gateway) executeAlterConsistency(s *sqllayer.AlterConsistencyStatement) (*ResultSet, error) {
+	key, fields, err := gw.schema.BuildAlterConsistencyCommand(s.Table, s.Mode)
+	if err != nil {
+		return nil, fmt.Errorf("alter consistency %q: %w", s.Table, err)
+	}
+	desc, err := gw.router.RouteKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("route alter consistency: %w", err)
+	}
+	return gw.sendToLeader(desc, &rs.RangeRequest{
+		Op:      rs.RangeOp_INSERT,
+		TableId: 0,
+		Key:     key,
+		Fields:  fieldsToProto(fields),
+	})
+}
+
+// sendToAnyReplica picks a replica via round-robin and sends the request to it.
+func (gw *Gateway) sendToAnyReplica(desc *RangeDescriptor, req *rs.RangeRequest) (*ResultSet, error) {
+	nodeID := gw.picker.Pick(desc.Replicas)
+	if nodeID == 0 {
+		// Fall back to leader if no replicas are registered.
+		return gw.sendToLeader(desc, req)
+	}
+	conn, ok := gw.conns[nodeID]
+	if !ok {
+		// Requested node not connected; fall back to leader.
+		return gw.sendToLeader(desc, req)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rs.NewRangeServiceClient(conn).Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("execute on replica %d: %w", nodeID, err)
+	}
+	if resp.Error != "" {
+		return nil, fmt.Errorf("range error: %s", resp.Error)
+	}
+	result := &ResultSet{}
+	for _, row := range resp.Rows {
+		rr := ResultRow{Key: row.Key}
+		for _, f := range row.Fields {
+			rr.Fields = append(rr.Fields, protoFieldToBTree(f))
+		}
+		result.Rows = append(result.Rows, rr)
+	}
+	return result, nil
+}
+
+// scatterGatherAP fans a SCAN across all ranges, routing each to any replica
+// (round-robin) instead of the leader.
+func (gw *Gateway) scatterGatherAP(
+	ranges []*RangeDescriptor,
+	queryStart, queryEnd uint64,
+	tableId uint32,
+	cols []int32,
+	where sqllayer.Expression,
+) (*ResultSet, error) {
+	type result struct {
+		rs  *ResultSet
+		err error
+	}
+	ch := make(chan result, len(ranges))
+	for _, desc := range ranges {
+		go func(desc *RangeDescriptor) {
+			scopedStart := max64(queryStart, desc.StartKey)
+			scopedEnd := min64(queryEnd, desc.EndKey-1)
+			out, err := gw.sendToAnyReplica(desc, &rs.RangeRequest{
+				Op:       rs.RangeOp_SCAN,
+				TableId:  tableId,
+				StartKey: scopedStart,
+				EndKey:   scopedEnd,
+				Where:    exprToProto(where),
+				Columns:  cols,
+			})
+			ch <- result{out, err}
+		}(desc)
+	}
+	merged := &ResultSet{}
+	for range ranges {
+		r := <-ch
+		if r.err != nil {
+			return nil, r.err
+		}
+		if merged.Columns == nil {
+			merged.Columns = r.rs.Columns
+			merged.ColTypes = r.rs.ColTypes
+		}
+		merged.Rows = append(merged.Rows, r.rs.Rows...)
+	}
+	return merged, nil
 }
 
 // scatterGather fans a SCAN out across multiple ranges, scoping each request to
