@@ -14,7 +14,6 @@ type HTTPServer struct {
 	gw      *partition.Gateway
 	sc      *sqllayer.SchemaCatalog
 	apiKeys map[string]bool
-	router  chi.Router
 }
 
 func NewHTTPServer(

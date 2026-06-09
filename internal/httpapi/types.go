@@ -3,7 +3,7 @@ package httpapi
 // Requests
 
 type CreateTableRequest struct {
-	Name    string         `json:"name"`
+	Name    string          `json:"name"`
 	Columns []ColumnDefJSON `json:"columns"`
 }
 

@@ -187,14 +187,14 @@ func mustStatus(t *testing.T, resp *http.Response, want int) {
 	t.Helper()
 	if resp.StatusCode != want {
 		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatalf("want HTTP %d, got %d: %s", want, resp.StatusCode, b)
 	}
 }
 
 func decode[T any](t *testing.T, resp *http.Response) T {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var v T
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -203,8 +203,8 @@ func decode[T any](t *testing.T, resp *http.Response) T {
 }
 
 func drainClose(resp *http.Response) {
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 // --- common operation helpers ---

@@ -21,8 +21,8 @@ import (
 	ap "github.com/your-username/DistributedDatabaseSystem/internal/AP"
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
-	"github.com/your-username/DistributedDatabaseSystem/internal/httpapi"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
+	"github.com/your-username/DistributedDatabaseSystem/internal/httpapi"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
 	"github.com/your-username/DistributedDatabaseSystem/internal/partition"
 	"github.com/your-username/DistributedDatabaseSystem/internal/raft"
@@ -195,7 +195,7 @@ func detectOutboundIP() string {
 	if err != nil {
 		return "127.0.0.1"
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 

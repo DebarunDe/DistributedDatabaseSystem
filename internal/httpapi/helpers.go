@@ -54,7 +54,7 @@ func parseExpressionFromTokens(tokens []sqllayer.Token) sqllayer.Expression {
 func respondJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 // respondError writes an error response

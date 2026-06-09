@@ -119,8 +119,8 @@ func grpcConnect(t *testing.T, srv *partition.RangeServer) *grpc.ClientConn {
 // clusterStack is a running multi-node HTTP server with direct BTree access for
 // verification.
 type clusterStack struct {
-	ts   *httptest.Server
-	bts  []*btree.BTree // per-node BTree, bts[0] backs the SchemaCatalog
+	ts  *httptest.Server
+	bts []*btree.BTree // per-node BTree, bts[0] backs the SchemaCatalog
 }
 
 // newTwoNodeCluster creates a 2-node HTTP-fronted cluster split at splitKey.
@@ -324,7 +324,7 @@ func rawInsert(client *http.Client, baseURL, table string, values map[string]any
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("status %d: %s", resp.StatusCode, body)
@@ -342,7 +342,7 @@ func rawSelect(client *http.Client, baseURL, table string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -973,7 +973,7 @@ func TestSimulation_Stress_ManyTablesCreatedConcurrently(t *testing.T) {
 				failed.Add(1)
 			}
 			if resp != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 		}(i)
 	}
