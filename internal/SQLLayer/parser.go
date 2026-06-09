@@ -61,6 +61,11 @@ func (p *parser) parseLiteral() (Literal, error) {
 	}
 }
 
+// ParseExpression parses a token slice as a standalone WHERE expression.
+func ParseExpression(tokens []Token) (Expression, error) {
+	return (&parser{tokens: tokens}).parseExpression()
+}
+
 // parseExpression handles OR (lowest precedence).
 func (p *parser) parseExpression() (Expression, error) {
 	left, err := p.parseAndExpr()
