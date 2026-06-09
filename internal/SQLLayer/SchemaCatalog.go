@@ -279,6 +279,17 @@ func (sc *SchemaCatalog) DropTable(tableName string) error {
 	return nil
 }
 
+// AllTableNames returns every table name currently in the schema cache.
+func (sc *SchemaCatalog) AllTableNames() []string {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	names := make([]string, 0, len(sc.cache))
+	for name := range sc.cache {
+		names = append(names, name)
+	}
+	return names
+}
+
 // FindTableSchema searches the cache for tableName
 func (sc *SchemaCatalog) FindTableSchema(tableName string) *TableSchemaValue {
 	sc.mu.RLock()

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"net/http"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -19,6 +21,7 @@ import (
 	ap "github.com/your-username/DistributedDatabaseSystem/internal/AP"
 	lock "github.com/your-username/DistributedDatabaseSystem/internal/Lock"
 	sqllayer "github.com/your-username/DistributedDatabaseSystem/internal/SQLLayer"
+	"github.com/your-username/DistributedDatabaseSystem/internal/httpapi"
 	btree "github.com/your-username/DistributedDatabaseSystem/internal/bTree"
 	pagemanager "github.com/your-username/DistributedDatabaseSystem/internal/pageManager"
 	"github.com/your-username/DistributedDatabaseSystem/internal/partition"
@@ -184,13 +187,28 @@ func startSignalHandler(servers ...*grpc.Server) {
 	}
 }
 
+// detectOutboundIP returns the IP address this host uses to reach external
+// destinations. It opens a UDP socket (no packets are sent) to discover which
+// local interface the OS would route through.
+func detectOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
 func main() {
 	dbPath := flag.String("db", "", "path to database file (required)")
 	port := flag.String("port", "5555", "port to listen on for SQL")
 	raftPort := flag.String("raft-port", "5556", "port to listen on for Raft RPC")
+	listenAddr := flag.String("listen-addr", "", "IP address to bind listeners (default: all interfaces, i.e. 0.0.0.0)")
 	nodeID := flag.Uint64("id", 0, "this node's Raft ID (0 = standalone, no Raft)")
 	peersFlag := flag.String("peers", "", "comma-separated peer list: id=addr,id=addr (e.g. 2=192.168.1.2:5556)")
-	advertiseAddr := flag.String("advertise-addr", "", "address peers use to reach this node's Raft port (e.g. 192.168.1.1:5556); defaults to localhost:<raft-port>")
+	advertiseAddr := flag.String("advertise-addr", "", "address peers use to reach this node's Raft port (e.g. 192.168.1.1:5556); defaults to <detected-outbound-ip>:<raft-port>")
+	httpPort := flag.String("http-port", "8080", "port for REST API")
+	apiKeysFlag := flag.String("api-keys", "", "comma-separated API keys")
 	flag.Parse()
 
 	if *dbPath == "" {
@@ -280,7 +298,7 @@ func main() {
 		}
 		self := *advertiseAddr
 		if self == "" {
-			self = "localhost:" + *raftPort
+			self = detectOutboundIP() + ":" + *raftPort
 		}
 		allNodes[*nodeID] = self
 
@@ -296,8 +314,16 @@ func main() {
 		for id, conn := range rn.PeerConns() {
 			gw.AddConn(id, conn)
 		}
+		// Self-connection: dial the same address this server is bound to.
+		// When --listen-addr is empty the server binds all interfaces, so we
+		// fall back to loopback (127.0.0.1). When it is set to a specific IP we
+		// must use that IP, because the server is not listening on any other.
+		selfDialHost := *listenAddr
+		if selfDialHost == "" {
+			selfDialHost = "127.0.0.1"
+		}
 		selfConn, err := grpc.NewClient(
-			"localhost:"+*raftPort,
+			selfDialHost+":"+*raftPort,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)
 		if err != nil {
@@ -347,14 +373,29 @@ func main() {
 
 	srv := &server{tm: tm, ex: ex, sc: sc, gw: gw}
 
-	lis, err := net.Listen("tcp", ":"+*port)
+	apiKeys := make(map[string]bool)
+	for _, k := range strings.Split(*apiKeysFlag, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			apiKeys[k] = true
+		}
+	}
+	httpSrv := httpapi.NewHTTPServer(gw, sc, apiKeys)
+	go func() {
+		addr := *listenAddr + ":" + *httpPort
+		log.Printf("HTTP REST API listening on %s", addr)
+		if err := http.ListenAndServe(addr, httpSrv.Routes()); err != nil {
+			log.Fatalf("http serve: %v", err)
+		}
+	}()
+
+	lis, err := net.Listen("tcp", *listenAddr+":"+*port)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterSQLServiceServer(grpcServer, srv)
 
-	raftLis, err := net.Listen("tcp", ":"+*raftPort)
+	raftLis, err := net.Listen("tcp", *listenAddr+":"+*raftPort)
 	if err != nil {
 		log.Fatalf("raft listen: %v", err)
 	}

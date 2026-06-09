@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/go-chi/chi/v5 v5.3.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
