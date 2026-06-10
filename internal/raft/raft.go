@@ -385,6 +385,17 @@ func (rn *RaftNode) startElection() {
 	}
 
 	majority := (len(rn.peers)+1)/2 + 1
+
+	// Single-node cluster: self-vote already satisfies majority; elect immediately.
+	if len(rn.peers) == 0 {
+		rn.mu.Lock()
+		if rn.state == RaftStateCandidate && rn.currentTerm == term {
+			rn.becomeLeader()
+		}
+		rn.mu.Unlock()
+		return
+	}
+
 	for range rn.peers {
 		if <-voteCh {
 			votesFor++
@@ -699,6 +710,11 @@ func (rn *RaftNode) resetElectionTimer() {
 func (rn *RaftNode) sendHeartbeats() {
 	for _, peerID := range rn.peers {
 		go rn.sendAppendEntries(peerID)
+	}
+	// Single-node cluster: with no peers every entry is already at quorum
+	// the moment the leader appends it, so advance commit immediately.
+	if len(rn.peers) == 0 {
+		rn.advanceCommitIndex()
 	}
 }
 
